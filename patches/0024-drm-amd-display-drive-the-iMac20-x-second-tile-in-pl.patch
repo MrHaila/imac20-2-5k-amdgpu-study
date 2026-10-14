@@ -1,0 +1,45 @@
+From e3ad7360b08a55bbbbcf69059159a59202bb728a Mon Sep 17 00:00:00 2001
+From: Teemu Haila <teemu.haila@gmail.com>
+Date: Sat, 10 Oct 2026 20:54:17 +0300
+Subject: [PATCH 24/31] drm/amd/display: drive the iMac20,x second tile in
+ plain DP panel mode (A3)
+
+The lean core drives every Apple second tile in eDP panel mode (alternate
+scrambler reset, DPCD 0x10A bit 0), except the iMac Pro panel, which never
+locks video that way. The iMac20,x panel (APP AE31/AE32) has never been
+brought up in eDP panel mode. The one configuration known to light both
+of its tiles, the t2linux 7003 patch on 2026-10-10, left link 1 in default
+DP panel mode. Match that known-good state.
+
+This is the cheapest thing to flip if the right tile trains but stays dark
+(SINK_STATUS 0x205 = 00).
+
+[adapter: new, Sysadmin patches/amdgpu-imac20-2-5k-stitch DESIGN.md A3]
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01SUvgXxxT5Apr7YLjKZVd2T
+---
+ drivers/gpu/drm/amd/display/dc/dc.h | 7 +++++++
+ 1 file changed, 7 insertions(+)
+
+diff --git a/drivers/gpu/drm/amd/display/dc/dc.h b/drivers/gpu/drm/amd/display/dc/dc.h
+index 5fbb88ac5..826ca6f20 100644
+--- a/drivers/gpu/drm/amd/display/dc/dc.h
++++ b/drivers/gpu/drm/amd/display/dc/dc.h
+@@ -2966,6 +2966,13 @@ static inline bool dc_link_is_apple_tiled_dp_panel_mode(const struct dc_link *li
+ 	switch (sink->edid_caps.product_id) {
+ 	case 0xAE1D:
+ 	case 0xAE1E:
++	/*
++	 * iMac20,x: untested in eDP panel mode. Plain DP mode is what the
++	 * t2linux iMac20 patch uses, and its second tile locked video that
++	 * way. If D1 shows the tile trained but dark (0x205 = 00), drop these.
++	 */
++	case 0xAE31:
++	case 0xAE32:
+ 		return true;
+ 	default:
+ 		return false;
+-- 
+2.55.0
+

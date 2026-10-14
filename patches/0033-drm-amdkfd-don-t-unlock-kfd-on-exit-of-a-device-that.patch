@@ -1,0 +1,57 @@
+From dc0e976c38dcb8b601954b72fc2c8bd4e8ef3888 Mon Sep 17 00:00:00 2001
+From: Teemu Haila <teemu.haila@gmail.com>
+Date: Mon, 12 Oct 2026 20:19:21 +0300
+Subject: [PATCH 33/33] drm/amdkfd: don't unlock kfd on exit of a device that
+ never initialised
+
+kgd2kfd_device_exit() ends with kgd2kfd_unlock_kfd(NULL), which drops the
+module-wide kfd_locked count. The matching increment happens in
+kgd2kfd_suspend(), reached from amdgpu_device_ip_fini_early() through
+amdgpu_amdkfd_suspend(), and only when kfd->init_complete is set.
+
+When amdgpu's probe fails in amdgpu_device_ip_init() (for example an SMU
+timeout before KFD init), amdgpu_device_ip_fini() still calls
+amdgpu_amdkfd_device_fini_sw() and so kgd2kfd_device_exit(), and the
+unconditional unlock leaves kfd_locked at -1. It is a static, so it stays
+there across the retry (deferred probe or a manual rebind). From then on
+every suspend raises it to 0 instead of 1, so kfd_suspend_all_processes()
+never runs, and the first resume prints "KFD suspend / resume ref. error".
+
+Only unlock when the device was initialised, mirroring the lock.
+
+Seen on an iMac20,2 (Navi 10), linux-t2 7.2.9: failed first probe plus a
+rebind, then the WARN on the first S3 resume.
+---
+ drivers/gpu/drm/amd/amdkfd/kfd_device.c | 9 ++++++++-
+ 1 file changed, 8 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/gpu/drm/amd/amdkfd/kfd_device.c b/drivers/gpu/drm/amd/amdkfd/kfd_device.c
+index 008a0719f..b68dc5b2b 100644
+--- a/drivers/gpu/drm/amd/amdkfd/kfd_device.c
++++ b/drivers/gpu/drm/amd/amdkfd/kfd_device.c
+@@ -979,6 +979,12 @@ out:
+ 
+ void kgd2kfd_device_exit(struct kfd_dev *kfd)
+ {
++	/*
++	 * Only an initialised device took the kfd driver lock, in
++	 * kgd2kfd_suspend() via amdgpu_amdkfd_suspend() from ip_fini_early.
++	 */
++	bool locked = kfd->init_complete;
++
+ 	if (kfd->init_complete) {
+ 		/* Cleanup KFD nodes */
+ 		kfd_cleanup_nodes(kfd, kfd->num_nodes);
+@@ -993,7 +999,8 @@ void kgd2kfd_device_exit(struct kfd_dev *kfd)
+ 	kfree(kfd);
+ 
+ 	/* after remove a kfd device unlock kfd driver */
+-	kgd2kfd_unlock_kfd(NULL);
++	if (locked)
++		kgd2kfd_unlock_kfd(NULL);
+ }
+ 
+ int kgd2kfd_pre_reset(struct kfd_dev *kfd,
+-- 
+2.55.0
+

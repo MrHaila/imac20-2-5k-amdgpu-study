@@ -1,0 +1,40 @@
+From 9323edbb11168d213cb6f762f47d0ed6d2d46520 Mon Sep 17 00:00:00 2001
+From: t2linux <t2linux@users.noreply.github.com>
+Date: Sun, 11 Oct 2026 23:30:43 +0300
+Subject: [PATCH 02/31] t2linux 6001-drm-amd-pm-Fix-boot-problems-in-5300
+ (linux-t2-patches 65fdd4d; amdgpu part only)
+
+---
+ drivers/gpu/drm/amd/pm/swsmu/smu11/smu_v11_0.c | 16 ++++++++++++++++
+ 1 file changed, 16 insertions(+)
+
+diff --git a/drivers/gpu/drm/amd/pm/swsmu/smu11/smu_v11_0.c b/drivers/gpu/drm/amd/pm/swsmu/smu11/smu_v11_0.c
+index d68ceee16..1d0c6874d 100644
+--- a/drivers/gpu/drm/amd/pm/swsmu/smu11/smu_v11_0.c
++++ b/drivers/gpu/drm/amd/pm/swsmu/smu11/smu_v11_0.c
+@@ -674,6 +674,22 @@ int smu_v11_0_set_allowed_mask(struct smu_context *smu)
+ 	int ret = 0;
+ 	uint32_t feature_mask[2];
+ 
++	if (smu->adev->pdev->vendor == 0x1002 && smu->adev->pdev->device == 0x7340 &&
++			smu->adev->pdev->subsystem_vendor == 0x106B &&
++			smu->adev->pdev->subsystem_device == 0x0219) {
++		ret = smu_cmn_send_smc_msg_with_param(smu, SMU_MSG_SetAllowedFeaturesMaskLow,
++				0xABC9AFBB, NULL);
++		if (ret)
++			goto failed;
++
++		ret = smu_cmn_send_smc_msg_with_param(smu, SMU_MSG_SetAllowedFeaturesMaskHigh,
++				0xFFFFFD42, NULL);
++		if (ret)
++			goto failed;
++
++		return 0;
++	}
++
+ 	if (smu_feature_list_is_empty(smu, SMU_FEATURE_LIST_ALLOWED) ||
+ 	    feature->feature_num < SMU_FEATURE_NUM_DEFAULT) {
+ 		ret = -EINVAL;
+-- 
+2.55.0
+

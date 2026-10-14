@@ -1,0 +1,384 @@
+From 027b4dd8da7eb590efbd1329626ee85458db32c1 Mon Sep 17 00:00:00 2001
+From: Teemu Haila <teemu.haila@gmail.com>
+Date: Mon, 12 Oct 2026 21:57:14 +0300
+Subject: [PATCH 34/37] drm/amd/display: recover a lost second tile in the
+ kernel (L5)
+
+When post-commit link health gives up (the second tile did not come back
+after two link-loss recoveries, the root link is bad, or the root is lit
+with no stream on the second tile), amdgpu_dm_tiled_request_full_modeset()
+set the root's link-status to BAD and sent a hotplug event, expecting the
+compositor to answer with a full modeset. KWin and Mutter do; wlroots and
+aquamarine do not, so on Hyprland the right half of the panel stayed dark
+until a DPMS cycle or a reboot.
+
+Do the full modeset in the kernel instead, the way
+amdgpu_dm_tiled_slave_sink_gained() already re-attaches the second tile:
+a new tiled_recover_work takes the modeset locks, clears link_state_valid
+on both tile links under dc_lock (so pipe_need_reprogram() really
+re-trains them) and runs dm_force_atomic_commit() on the stitched root.
+That commit tears down and re-adds both tile streams and arms a fresh
+health sequence, which queues the worker again if it fails too.
+
+It needs its own worker because the resync worker holds dc_lock and the
+modeset locks rank above it. Bounds: at most APPLE5K_KMODESET_MAX (2)
+kernel modesets in a row, the second one after a 2 s back-off; a passing
+health sequence resets the count. They spend the existing link-status
+budget (3 per minute, 12 per boot); a full minute is re-queued at the
+end of its window. A DPMS-off CRTC is never resurrected: the worker
+skips it, and the next DPMS-on re-arms link health. After the kernel
+modesets the old link-status BAD report remains the last resort; it now
+runs with the modeset locks dropped, as it takes connection_mutex
+itself. The worker is cancelled at shutdown and fini after the resync
+worker, which is what queues it.
+
+[adapter: iMac20 PoC, REVIEW.md L5]
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.c | 209 +++++++++++++++---
+ .../gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.h |  12 +
+ 2 files changed, 195 insertions(+), 26 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.c b/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.c
+index f2f6ed330..95ce7bc39 100644
+--- a/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.c
++++ b/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.c
+@@ -977,6 +977,7 @@ static bool amdgpu_dm_tiled_stitch_apply_synthetic_edid(
+ static int amdgpu_dm_init(struct amdgpu_device *adev);
+ static void amdgpu_dm_fini(struct amdgpu_device *adev);
+ static void amdgpu_dm_tiled_resync_work(struct work_struct *work);
++static void amdgpu_dm_tiled_recover_work(struct work_struct *work);
+ static void amdgpu_dm_queue_tiled_resync(struct amdgpu_device *adev, bool modeset);
+ static bool is_freesync_video_mode(const struct drm_display_mode *mode, struct amdgpu_dm_connector *aconnector);
+ static void reset_freesync_config_for_crtc(struct dm_crtc_state *new_crtc_state);
+@@ -2915,7 +2916,9 @@ void amdgpu_dm_apple5k_going_down(struct amdgpu_device *adev)
+ 		adev->dm.dc->apple_5k_going_down = true;
+ 		amdgpu_dm_apple5k_clear_if_dark(adev);
+ 		mutex_unlock(&adev->dm.dc_lock);
++		/* Resync first: it is what queues the recovery worker. */
+ 		cancel_delayed_work_sync(&adev->dm.tiled_resync_work);
++		cancel_delayed_work_sync(&adev->dm.tiled_recover_work);
+ 	}
+ }
+ 
+@@ -2957,10 +2960,14 @@ static int amdgpu_dm_init(struct amdgpu_device *adev)
+ 	adev->dm.tiled_link_recoveries = 0;
+ 	adev->dm.tiled_sync_pending = false;
+ 	adev->dm.tiled_resume_modeset = false;
++	INIT_DELAYED_WORK(&adev->dm.tiled_recover_work, amdgpu_dm_tiled_recover_work);
++	adev->dm.tiled_kmodeset_tries = 0;
++	adev->dm.tiled_fail_root = false;
+ 	drm_info(adev_to_drm(adev),
+-		 "APPLE5K: link-health build=post-commit-recovery checks=%u recoveries=%u delay_ms=%u+%u\n",
++		 "APPLE5K: link-health build=post-commit-recovery checks=%u recoveries=%u delay_ms=%u+%u kmodesets=%u\n",
+ 		 APPLE5K_LINK_CHECKS, APPLE5K_LINK_RECOVERIES,
+-		 APPLE5K_LINK_SETTLE_MS, APPLE5K_LINK_RECHECK_MS);
++		 APPLE5K_LINK_SETTLE_MS, APPLE5K_LINK_RECHECK_MS,
++		 APPLE5K_KMODESET_MAX);
+ 	mutex_init(&adev->dm.audio_lock);
+ 
+ 	spin_lock_init(&adev->dm.dmub_lock);
+@@ -3369,6 +3376,7 @@ static void amdgpu_dm_fini(struct amdgpu_device *adev)
+ 	adev->dm.tiled_resync_stopping = true;
+ 	mutex_unlock(&adev->dm.dc_lock);
+ 	cancel_delayed_work_sync(&adev->dm.tiled_resync_work);
++	cancel_delayed_work_sync(&adev->dm.tiled_recover_work);
+ 
+ 	if (adev->dm.vblank_control_workqueue) {
+ 		destroy_workqueue(adev->dm.vblank_control_workqueue);
+@@ -16272,8 +16280,10 @@ static bool amdgpu_dm_tiled_check_links(struct amdgpu_device *adev)
+ 				 slave->tiled_peer == root,
+ 			 dc->current_state->stream_count);
+ 		/* Root lit, second tile present but not streaming: right tile dark. */
+-		if (root && !slave && root->tiled_peer && root->tiled_peer->local_sink)
++		if (root && !slave && root->tiled_peer && root->tiled_peer->local_sink) {
++			adev->dm.tiled_fail_root = false;
+ 			adev->dm.tiled_link_status_bad = true;
++		}
+ 		return false;
+ 	}
+ 
+@@ -16285,16 +16295,17 @@ static bool amdgpu_dm_tiled_check_links(struct amdgpu_device *adev)
+ 	/*
+ 	 * Never restart the root from here: its link-loss handling is a full
+ 	 * eDP power cycle with a >= 500 ms T12 wait, all under dc_lock. Hand a
+-	 * bad root, or a second tile that did not recover, to the compositor
+-	 * as a link-status failure: it performs a full modeset, which
+-	 * re-trains both links (link_state_valid is cleared for both).
++	 * bad root, or a second tile that did not recover, to the recovery
++	 * worker: it performs a full modeset, which re-trains both links
++	 * (link_state_valid is cleared for both).
+ 	 */
+ 	if (!root_ready ||
+ 	    adev->dm.tiled_link_recoveries >= APPLE5K_LINK_RECOVERIES ||
+ 	    adev->dm.tiled_link_checks <= 1) {
+ 		drm_err(adev_to_drm(adev),
+-			"APPLE5K: link-health FAIL after %u second-tile recoveries root=%d slave=%d; requesting a full modeset\n",
++			"APPLE5K: link-health FAIL after %u second-tile recoveries root=%d slave=%d; queueing in-kernel recovery\n",
+ 			adev->dm.tiled_link_recoveries, root_ready, slave_ready);
++		adev->dm.tiled_fail_root = !root_ready;
+ 		adev->dm.tiled_link_status_bad = true;
+ 		return false;
+ 	}
+@@ -16308,10 +16319,35 @@ static bool amdgpu_dm_tiled_check_links(struct amdgpu_device *adev)
+ }
+ 
+ /*
+- * Runs outside dc_lock. Clear link_state_valid on both tile links so the
+- * modeset really reprograms them (pipe_need_reprogram() honours it), then
+- * report link status BAD on the root connector: KWin answers with a full
+- * modeset. Bounded per minute; the modeset's own latch writes pulse HPD.
++ * One full-modeset attempt from the shared budget: APPLE5K_BAD_PER_MINUTE per
++ * minute and APPLE5K_BAD_PER_BOOT per boot, kernel modesets and link-status
++ * reports alike. Only the recovery worker spends it, so the worker serialises
++ * the fields. Returns 0 when an attempt was taken, the jiffies left in this
++ * minute's window when that is used up, or -1 once the boot's budget is gone.
++ */
++static long amdgpu_dm_tiled_take_budget(struct amdgpu_device *adev)
++{
++	if (!adev->dm.tiled_bad_window ||
++	    !time_before(jiffies, adev->dm.tiled_bad_window + 60 * HZ)) {
++		adev->dm.tiled_bad_window = jiffies;
++		adev->dm.tiled_bad_count = 0;
++	}
++	if (adev->dm.tiled_bad_total >= APPLE5K_BAD_PER_BOOT)
++		return -1;
++	if (adev->dm.tiled_bad_count >= APPLE5K_BAD_PER_MINUTE)
++		return max_t(long, (long)(adev->dm.tiled_bad_window + 60 * HZ - jiffies), 1);
++	adev->dm.tiled_bad_count++;
++	adev->dm.tiled_bad_total++;
++	return 0;
++}
++
++/*
++ * Runs outside dc_lock and the modeset locks. Clear link_state_valid on both
++ * tile links so the modeset really reprograms them (pipe_need_reprogram()
++ * honours it), then report link status BAD on the root connector: KWin
++ * answers with a full modeset. The last resort after the kernel modesets of
++ * amdgpu_dm_tiled_recover_work(), for a root link that stays bad. Bounded per
++ * minute; the modeset's own latch writes pulse HPD.
+  */
+ static void amdgpu_dm_tiled_request_full_modeset(struct amdgpu_device *adev)
+ {
+@@ -16320,18 +16356,10 @@ static void amdgpu_dm_tiled_request_full_modeset(struct amdgpu_device *adev)
+ 	struct amdgpu_dm_connector *root = NULL;
+ 	int i;
+ 
+-	if (!adev->dm.tiled_bad_window ||
+-	    !time_before(jiffies, adev->dm.tiled_bad_window + 60 * HZ)) {
+-		adev->dm.tiled_bad_window = jiffies;
+-		adev->dm.tiled_bad_count = 0;
+-	}
+-	if (adev->dm.tiled_bad_count >= APPLE5K_BAD_PER_MINUTE ||
+-	    adev->dm.tiled_bad_total >= APPLE5K_BAD_PER_BOOT) {
++	if (amdgpu_dm_tiled_take_budget(adev)) {
+ 		drm_warn_once(dev, "APPLE5K: full-modeset requests rate limited; leaving the panel as it is\n");
+ 		return;
+ 	}
+-	adev->dm.tiled_bad_count++;
+-	adev->dm.tiled_bad_total++;
+ 
+ 	for (i = 0; i < dc->link_count; i++) {
+ 		if (dc_link_is_apple_tiled_root(dc->links[i])) {
+@@ -16357,6 +16385,124 @@ static void amdgpu_dm_tiled_request_full_modeset(struct amdgpu_device *adev)
+ 		 root->base.name, adev->dm.tiled_bad_count, APPLE5K_BAD_PER_MINUTE);
+ }
+ 
++/*
++ * A failed link-health sequence. wlroots and aquamarine never answer link
++ * status BAD, so on Hyprland the right tile would stay dark until a DPMS
++ * cycle. Do the full modeset in the kernel instead, as
++ * amdgpu_dm_tiled_slave_sink_gained() does: a forced commit of the root with
++ * mode_changed set tears down and re-adds both tile streams, and with
++ * link_state_valid cleared DC re-trains both links. Its commit arms a new
++ * health sequence, which comes back here if that fails too.
++ *
++ * Lock order as in the commit path: modeset locks, then dc_lock (never held
++ * across the commit). Bounded to APPLE5K_KMODESET_MAX in a row, reset by a
++ * passing sequence, and by the link-status budget. A root link that stays bad
++ * then goes to the compositor as link status BAD, the old behaviour.
++ */
++static void amdgpu_dm_tiled_recover_work(struct work_struct *work)
++{
++	struct amdgpu_display_manager *dm =
++		container_of(to_delayed_work(work), struct amdgpu_display_manager,
++			     tiled_recover_work);
++	struct amdgpu_device *adev = dm->adev;
++	struct drm_device *dev = adev_to_drm(adev);
++	struct dc *dc = dm->dc;
++	struct amdgpu_dm_connector *root = NULL;
++	const struct dm_crtc_state *cs = NULL;
++	struct drm_crtc *crtc = NULL;
++	bool fail_root, request_bad = false;
++	long wait;
++	u8 tries;
++	int i, ret;
++
++	if (!dc)
++		return;
++
++	drm_modeset_lock_all(dev);
++
++	for (i = 0; i < dc->link_count; i++) {
++		if (amdgpu_dm_link_is_tiled_stitch_root(dc->links[i])) {
++			root = dc->links[i]->priv;
++			break;
++		}
++	}
++	if (!root)
++		goto unlock;
++
++	/*
++	 * Userspace DPMS-off wins over the recovery: never resurrect a dark
++	 * panel. The next DPMS-on is a tiled modeset and re-arms link health.
++	 * The encoder check also guards dm_force_atomic_commit(), which does
++	 * not check it.
++	 */
++	if (root->base.encoder)
++		crtc = root->base.encoder->crtc;
++	if (crtc && crtc->state)
++		cs = to_dm_crtc_state(crtc->state);
++	if (!cs || !crtc->state->active || !cs->stream || cs->stream->dpms_off) {
++		drm_info(dev, "APPLE5K: tile recovery skipped: crtc off\n");
++		mutex_lock(&dm->dc_lock);
++		dm->tiled_kmodeset_tries = 0;
++		mutex_unlock(&dm->dc_lock);
++		goto unlock;
++	}
++
++	mutex_lock(&dm->dc_lock);
++	if (adev->in_suspend || amdgpu_in_reset(adev) ||
++	    dm->tiled_resync_stopping || dc->apple_5k_going_down) {
++		/* Resume and GPU reset re-commit the pair and re-arm link health. */
++		drm_info(dev,
++			 "APPLE5K: tile recovery skipped: stopping=%d going_down=%d suspend=%d reset=%d\n",
++			 dm->tiled_resync_stopping, dc->apple_5k_going_down,
++			 adev->in_suspend, amdgpu_in_reset(adev));
++		mutex_unlock(&dm->dc_lock);
++		goto unlock;
++	}
++	tries = dm->tiled_kmodeset_tries;
++	fail_root = dm->tiled_fail_root;
++	wait = tries < APPLE5K_KMODESET_MAX ? amdgpu_dm_tiled_take_budget(adev) : -1;
++	if (wait > 0) {
++		/* Queued under dc_lock, so going_down's cancel cannot miss it. */
++		mod_delayed_work(system_wq, &dm->tiled_recover_work, wait);
++		mutex_unlock(&dm->dc_lock);
++		drm_info(dev, "APPLE5K: tile recovery rate limited; retrying in %u ms\n",
++			 jiffies_to_msecs(wait));
++		goto unlock;
++	}
++	if (!wait) {
++		dm->tiled_kmodeset_tries = ++tries;
++		root->dc_link->link_state_valid = false;
++		if (root->dc_link->tiled_peer)
++			root->dc_link->tiled_peer->link_state_valid = false;
++		mutex_unlock(&dm->dc_lock);
++
++		ret = dm_force_atomic_commit(&root->base);
++		drm_info(dev, "APPLE5K: link-health kernel modeset %u/%u: ret=%d\n",
++			 tries, APPLE5K_KMODESET_MAX, ret);
++		if (ret) {
++			/* No commit, so no health sequence will call us back. */
++			mutex_lock(&dm->dc_lock);
++			if (!dm->tiled_resync_stopping && !dc->apple_5k_going_down)
++				mod_delayed_work(system_wq, &dm->tiled_recover_work,
++						 msecs_to_jiffies(APPLE5K_KMODESET_BACKOFF_MS));
++			mutex_unlock(&dm->dc_lock);
++		}
++		goto unlock;
++	}
++	mutex_unlock(&dm->dc_lock);
++
++	if (!fail_root)
++		drm_warn(dev, "APPLE5K: second tile still down after %u kernel modesets\n",
++			 tries);
++	request_bad = true;
++
++unlock:
++	drm_modeset_unlock_all(dev);
++	/* Takes connection_mutex itself: it must run with the locks dropped. */
++	if (request_bad)
++		amdgpu_dm_tiled_request_full_modeset(adev);
++}
++
+ /*
+  * Vertical phase of the second tile OTG relative to the first, in lines,
+  * wrapped to (-v_total/2, v_total/2]. The first OTG is read before and after
+@@ -16506,7 +16652,7 @@ static void amdgpu_dm_tiled_resync_work(struct work_struct *work)
+ 			     tiled_resync_work);
+ 	struct amdgpu_device *adev = dm->adev;
+ 	struct dc *dc = dm->dc;
+-	bool bad = false, armed;
++	bool armed;
+ 	int i;
+ 
+ 	mutex_lock(&dm->dc_lock);
+@@ -16539,12 +16685,15 @@ static void amdgpu_dm_tiled_resync_work(struct work_struct *work)
+ 			 "APPLE5K: link-health pass %u/%u recoveries=%u\n",
+ 			 APPLE5K_LINK_CHECKS - dm->tiled_link_checks + 1,
+ 			 APPLE5K_LINK_CHECKS, dm->tiled_link_recoveries);
+-		if (!amdgpu_dm_tiled_check_links(adev))
++		if (!amdgpu_dm_tiled_check_links(adev)) {
+ 			dm->tiled_link_checks = 0;
+-		else if (!--dm->tiled_link_checks)
++		} else if (!--dm->tiled_link_checks) {
+ 			drm_info(adev_to_drm(adev),
+ 				 "APPLE5K: link-health PASS: both tiles healthy after %u recovery attempts\n",
+ 				 dm->tiled_link_recoveries);
++			/* A fresh failure starts a fresh series of kernel modesets. */
++			dm->tiled_kmodeset_tries = 0;
++		}
+ 	}
+ 
+ 	if (dc->current_state && dm->tiled_sync_pending) {
+@@ -16568,11 +16717,19 @@ static void amdgpu_dm_tiled_resync_work(struct work_struct *work)
+ 		mod_delayed_work(system_wq, &dm->tiled_resync_work,
+ 				 msecs_to_jiffies(APPLE5K_LINK_RECHECK_MS));
+ out:
+-	bad = dm->tiled_link_status_bad;
++	/*
++	 * The recovery needs the modeset locks, which rank above dc_lock: hand
++	 * it to its own worker. The first kernel modeset of a series runs at
++	 * once, a repeat only after a back-off, so a link that fails again
++	 * straight away does not keep the panel in back-to-back modesets.
++	 */
++	if (dm->tiled_link_status_bad && !dm->tiled_resync_stopping &&
++	    !(dc && dc->apple_5k_going_down))
++		mod_delayed_work(system_wq, &dm->tiled_recover_work,
++				 dm->tiled_kmodeset_tries ?
++				 msecs_to_jiffies(APPLE5K_KMODESET_BACKOFF_MS) : 0);
+ 	dm->tiled_link_status_bad = false;
+ 	mutex_unlock(&dm->dc_lock);
+-	if (bad)
+-		amdgpu_dm_tiled_request_full_modeset(adev);
+ }
+ 
+ static void amdgpu_dm_queue_tiled_resync(struct amdgpu_device *adev, bool modeset)
+diff --git a/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.h b/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.h
+index b56539f0b..0a7f7c9fd 100644
+--- a/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.h
++++ b/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.h
+@@ -684,6 +684,18 @@ struct amdgpu_display_manager {
+ 	u8 tiled_bad_total;
+ #define APPLE5K_BAD_PER_MINUTE 3
+ #define APPLE5K_BAD_PER_BOOT 12
++	/*
++	 * wlroots/aquamarine never answer link status BAD, so recover a failed
++	 * health sequence with an in-kernel forced modeset instead, from its
++	 * own worker (it needs the modeset locks, which rank above dc_lock).
++	 * At most APPLE5K_KMODESET_MAX in a row, sharing the budget above.
++	 * tiled_kmodeset_tries and tiled_fail_root are protected by dc_lock.
++	 */
++	struct delayed_work tiled_recover_work;
++	u8 tiled_kmodeset_tries;
++	bool tiled_fail_root;
++#define APPLE5K_KMODESET_MAX 2
++#define APPLE5K_KMODESET_BACKOFF_MS 2000
+ /* DCE < 12: re-run the one-shot OTG alignment only beyond this phase error. */
+ #define APPLE5K_REALIGN_TOLERANCE_LINES 3
+ 	bool disable_hpd_irq;
+-- 
+2.55.0
+

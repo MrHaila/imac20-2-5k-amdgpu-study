@@ -1,0 +1,131 @@
+From daaa0279ec586a75b7f9d0ace7cf9a7e60ed2945 Mon Sep 17 00:00:00 2001
+From: Teemu Haila <teemu.haila@gmail.com>
+Date: Mon, 12 Oct 2026 21:57:14 +0300
+Subject: [PATCH 36/37] drm/amdgpu: tiled_fault debug parameter for the 5K tile
+ recovery paths
+
+The second-tile recovery paths of the stitched Apple 5K panel (link-loss
+retrain, kernel modeset, single-tile fallback, re-latch) only run when
+link 1 fails, which cannot be provoked on an iMac without opening it.
+Add amdgpu.tiled_fault (0644, default 0) to fake those failures.
+
+N > 0: the next N post-commit link-health reads of the second tile report
+it not ready, after the real DPCD read (so the log still shows the real
+status). One failed health sequence takes about 3 reads, so N = 2
+exercises the existing retrain, 3-8 the kernel modesets, 9 or more the
+single-tile fallback. -1: additionally create_tiled_peer_stream() returns
+NULL, i.e. the root is lit without the second tile, which goes through
+the kernel modesets to the fallback. Writing 0 and cycling DPMS then
+exercises the re-latch (at least 60 s after the fallback).
+
+No DPCD writes; a non-zero value at load is logged as a warning.
+
+[adapter: iMac20 PoC, REVIEW.md L5/L6 test hook]
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ drivers/gpu/drm/amd/amdgpu/amdgpu.h           |  1 +
+ drivers/gpu/drm/amd/amdgpu/amdgpu_drv.c       | 17 +++++++++++++
+ .../gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.c | 25 +++++++++++++++++++
+ 3 files changed, 43 insertions(+)
+
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu.h b/drivers/gpu/drm/amd/amdgpu/amdgpu.h
+index bf0f98126..df664f4a3 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu.h
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu.h
+@@ -262,6 +262,7 @@ extern int amdgpu_umsch_mm;
+ extern int amdgpu_seamless;
+ extern int amdgpu_tiled_stitch;
+ extern int amdgpu_tiled_genlock;
++extern int amdgpu_tiled_fault;
+ extern int amdgpu_umsch_mm_fwlog;
+ 
+ extern int amdgpu_user_partt_mode;
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_drv.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_drv.c
+index 081b11836..44476056f 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_drv.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_drv.c
+@@ -242,6 +242,7 @@ int amdgpu_umsch_mm;
+ int amdgpu_seamless = -1; /* auto */
+ int amdgpu_tiled_stitch = -1; /* auto */
+ int amdgpu_tiled_genlock; /* 0: one-shot + measured re-align */
++int amdgpu_tiled_fault; /* 0: no fault injection */
+ uint amdgpu_debug_mask;
+ int amdgpu_agp = -1; /* auto */
+ int amdgpu_wbrf = -1;
+@@ -1066,6 +1067,22 @@ MODULE_PARM_DESC(tiled_genlock,
+ 	"iMac20,x 5K tile genlock (0 = one-shot + measured re-align (default), 1 = per-frame OTG reset)");
+ module_param_named(tiled_genlock, amdgpu_tiled_genlock, int, 0444);
+ 
++/**
++ * DOC: tiled_fault (int)
++ * Debug: exercise the recovery paths of the stitched Apple 5K panel without
++ * pulling a cable. N > 0: the next N post-commit link-health reads of the
++ * second tile report it not ready, after the real DPCD read. One failed
++ * health sequence takes about 3 reads, so N = 2 exercises the second-tile
++ * retrain, 3-8 the kernel modesets, 9 or more the single-tile fallback.
++ * -1: the second tile's stream is never created and the tile never reads
++ * ready (root lit without the second tile: kernel modesets, then the
++ * fallback). Writing 0 and cycling DPMS at least a minute after the fallback
++ * then exercises the re-latch.
++ */
++MODULE_PARM_DESC(tiled_fault,
++	"Debug: fake second-tile link failures on the stitched Apple 5K panel (0 = off (default), N > 0 = next N link-health reads fail (~3 per failed sequence: 2 retrain, 3-8 kernel modeset, >= 9 single-tile fallback), -1 = also no second-tile stream)");
++module_param_named(tiled_fault, amdgpu_tiled_fault, int, 0644);
++
+ /**
+  * DOC: debug_mask (uint)
+  * Debug options for amdgpu, work as a binary mask with the following options:
+diff --git a/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.c b/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.c
+index e9d5887ef..bdba6d1b3 100644
+--- a/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.c
++++ b/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.c
+@@ -3160,6 +3160,10 @@ static int amdgpu_dm_init(struct amdgpu_device *adev)
+ 			 amdgpu_tiled_stitch, amdgpu_tiled_genlock,
+ 			 amdgpu_tiled_genlock == 1 ? "per-frame reset" :
+ 						     "one-shot + measured re-align");
++	if (amdgpu_tiled_fault)
++		drm_warn(adev_to_drm(adev),
++			 "APPLE5K: tiled_fault=%d: faking second-tile link failures (debug)\n",
++			 amdgpu_tiled_fault);
+ 
+ 	if (adev->dm.bb_from_dmub)
+ 		init_data.bb_from_dmub = adev->dm.bb_from_dmub;
+@@ -13984,6 +13988,13 @@ create_tiled_peer_stream(struct dc *dc, struct dc_state *context,
+ 	if (!root_stream || !root_stream->link)
+ 		return NULL;
+ 
++	/* amdgpu.tiled_fault=-1: a root lit without its second tile. */
++	if (READ_ONCE(amdgpu_tiled_fault) < 0) {
++		drm_warn(adev_to_drm(dc->ctx->driver_context),
++			 "APPLE5K: tiled_fault: not creating the second tile's stream\n");
++		return NULL;
++	}
++
+ 	peer_link = root_stream->link->tiled_peer;
+ 	if (!peer_link || !peer_link->local_sink)
+ 		return NULL;
+@@ -16362,6 +16373,20 @@ static bool amdgpu_dm_tiled_link_ready(struct amdgpu_device *adev,
+ 	drm_info(adev_to_drm(adev),
+ 		 "APPLE5K: link-health link[%u] aux=%d lanes=%u status=%*ph ready=%d\n",
+ 		 link->link_index, ret, lanes, (int)sizeof(status), status, ready);
++
++	/* amdgpu.tiled_fault; the caller's dc_lock serialises the count. */
++	if (link->tiled_role == DC_TILED_ROLE_SLAVE) {
++		int fault = READ_ONCE(amdgpu_tiled_fault);
++
++		if (fault) {
++			if (fault > 0)
++				WRITE_ONCE(amdgpu_tiled_fault, --fault);
++			drm_warn(adev_to_drm(adev),
++				 "APPLE5K: tiled_fault: forcing link[%u] not ready (%d left)\n",
++				 link->link_index, fault);
++			ready = false;
++		}
++	}
+ 	return ready;
+ }
+ 
+-- 
+2.55.0
+

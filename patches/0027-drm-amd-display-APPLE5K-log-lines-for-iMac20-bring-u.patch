@@ -1,0 +1,181 @@
+From 11dd3e97fbbd56097ba511c34ae0315ddb3b07cb Mon Sep 17 00:00:00 2001
+From: Teemu Haila <teemu.haila@gmail.com>
+Date: Sat, 10 Oct 2026 20:58:46 +0300
+Subject: [PATCH 27/31] drm/amd/display: APPLE5K log lines for iMac20 bring-up
+ (A8)
+
+The reference stack already logs the stitch decisions (TILED_STITCH:) and
+link health (APPLE5K: link-health). Add the three things a test rig
+needs on the iMac20 that it does not yet say, all only on a DMI-matched
+iMac20:
+
+ - at DM init, which tiled_stitch and tiled_genlock values are in force;
+ - when the pair is wired, which link indices it pairs (checks A2);
+ - after each settle pass, which OTG drives each tile, which genlock mode
+   ran, and the measured phase between them in lines. This is at info
+   level while a post-modeset link-health sequence is armed and at debug
+   level afterwards, so page flips do not flood the log.
+
+The pair lookup in amdgpu_dm_tiled_measured_realign() moves into
+amdgpu_dm_tiled_find_pair() so both callers share it. No behaviour change.
+
+[adapter: new, Sysadmin patches/amdgpu-imac20-2-5k-stitch DESIGN.md A8]
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01SUvgXxxT5Apr7YLjKZVd2T
+---
+ .../gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.c | 86 +++++++++++++++----
+ .../amd/display/amdgpu_dm/amdgpu_dm_helpers.c |  5 ++
+ 2 files changed, 75 insertions(+), 16 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.c b/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.c
+index 2888357aa..1a2fc5364 100644
+--- a/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.c
++++ b/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.c
+@@ -3067,6 +3067,12 @@ static int amdgpu_dm_init(struct amdgpu_device *adev)
+ 		init_data.flags.apple_imac20_tiles = true;
+ 	if (adev->dm.apple_imac20_tiles_quirk && amdgpu_tiled_genlock == 1)
+ 		init_data.flags.apple_tiled_genlock = true;
++	if (adev->dm.apple_imac20_tiles_quirk)
++		drm_info(adev_to_drm(adev),
++			 "APPLE5K: iMac20 tiles: tiled_stitch=%d tiled_genlock=%d (%s)\n",
++			 amdgpu_tiled_stitch, amdgpu_tiled_genlock,
++			 amdgpu_tiled_genlock == 1 ? "per-frame reset" :
++						     "one-shot + measured re-align");
+ 
+ 	if (adev->dm.bb_from_dmub)
+ 		init_data.bb_from_dmub = adev->dm.bb_from_dmub;
+@@ -16171,6 +16177,64 @@ static int amdgpu_dm_tiled_phase_delta(struct pipe_ctx *pair[2], int v_total)
+ 	return delta;
+ }
+ 
++/* The two lit OTG-head pipes of the stitched tile pair, in pipe order. */
++static bool amdgpu_dm_tiled_find_pair(struct dc *dc, struct dc_state *context,
++				      struct pipe_ctx *pair[2])
++{
++	int i, n = 0;
++
++	for (i = 0; i < dc->res_pool->pipe_count && n < 2; i++) {
++		struct pipe_ctx *pipe = &context->res_ctx.pipe_ctx[i];
++
++		if (!resource_is_pipe_type(pipe, OPP_HEAD) || !pipe->stream ||
++		    pipe->stream->dpms_off || !pipe->stream_res.tg ||
++		    !pipe->stream_res.tg->funcs->get_position ||
++		    !pipe->stream->link || !pipe->stream->link->tiled_peer)
++			continue;
++		if (!amdgpu_dm_link_is_tiled_stitch_root(pipe->stream->link) &&
++		    !amdgpu_dm_link_is_tiled_stitch_slave(pipe->stream->link))
++			continue;
++		pair[n++] = pipe;
++	}
++	return n == 2 && pair[0]->stream->link->tiled_peer == pair[1]->stream->link;
++}
++
++/*
++ * iMac20,x bring-up: one line per settle pass with the OTG of each tile and
++ * their phase, so a rig can tell the genlock modes apart from the log alone.
++ * Info level only while a post-modeset link-health sequence is armed (a few
++ * lines per modeset); every later flip would otherwise add one.
++ */
++static void amdgpu_dm_tiled_log_phase(struct amdgpu_device *adev, bool verbose)
++{
++	struct dc *dc = adev->dm.dc;
++	struct pipe_ctx *pair[2] = { NULL, NULL };
++	struct pipe_ctx *rp[2];
++	int v_total, delta;
++
++	if (!dc->current_state || !amdgpu_dm_tiled_find_pair(dc, dc->current_state, pair))
++		return;
++
++	/* Root first: a positive result means the peer is N lines ahead. */
++	rp[0] = pair[0]->stream->link->tiled_role == DC_TILED_ROLE_ROOT ? pair[0] : pair[1];
++	rp[1] = rp[0] == pair[0] ? pair[1] : pair[0];
++	v_total = rp[0]->stream->timing.v_total;
++	if (v_total < 2)
++		return;
++	delta = amdgpu_dm_tiled_phase_delta(rp, v_total);
++
++	if (verbose)
++		drm_info(adev_to_drm(adev),
++			 "APPLE5K: tile phase genlock=%s root link[%u] OTG%u, peer link[%u] OTG%u: %d lines\n",
++			 amdgpu_dm_per_frame_crtc_reset_supported(dc) ? "per-frame" : "one-shot",
++			 rp[0]->stream->link->link_index, rp[0]->stream_res.tg->inst,
++			 rp[1]->stream->link->link_index, rp[1]->stream_res.tg->inst,
++			 delta);
++	else
++		drm_dbg_kms(adev_to_drm(adev), "APPLE5K: tile phase peer-root: %d lines\n",
++			    delta);
++}
++
+ /*
+  * DCE < 12: the only alignment the tiles ever get is the one-shot
+  * dce110_enable_timing_synchronization() run inside a modeset commit, and
+@@ -16187,25 +16251,12 @@ static void amdgpu_dm_tiled_measured_realign(struct amdgpu_device *adev)
+ 	struct dc *dc = adev->dm.dc;
+ 	struct dc_state *context = dc->current_state;
+ 	struct pipe_ctx *pair[2] = { NULL, NULL };
+-	int i, n = 0, v_total, delta, delta_after;
++	int v_total, delta, delta_after;
+ 
+ 	if (!context || !dc->hwss.enable_timing_synchronization)
+ 		return;
+ 
+-	for (i = 0; i < dc->res_pool->pipe_count && n < 2; i++) {
+-		struct pipe_ctx *pipe = &context->res_ctx.pipe_ctx[i];
+-
+-		if (!resource_is_pipe_type(pipe, OPP_HEAD) || !pipe->stream ||
+-		    pipe->stream->dpms_off || !pipe->stream_res.tg ||
+-		    !pipe->stream_res.tg->funcs->get_position ||
+-		    !pipe->stream->link || !pipe->stream->link->tiled_peer)
+-			continue;
+-		if (!amdgpu_dm_link_is_tiled_stitch_root(pipe->stream->link) &&
+-		    !amdgpu_dm_link_is_tiled_stitch_slave(pipe->stream->link))
+-			continue;
+-		pair[n++] = pipe;
+-	}
+-	if (n != 2 || pair[0]->stream->link->tiled_peer != pair[1]->stream->link)
++	if (!amdgpu_dm_tiled_find_pair(dc, context, pair))
+ 		return;
+ 
+ 	if (!resource_are_streams_timing_synchronizable(pair[0]->stream,
+@@ -16253,10 +16304,11 @@ static void amdgpu_dm_tiled_resync_work(struct work_struct *work)
+ 			     tiled_resync_work);
+ 	struct amdgpu_device *adev = dm->adev;
+ 	struct dc *dc = dm->dc;
+-	bool bad = false;
++	bool bad = false, armed;
+ 	int i;
+ 
+ 	mutex_lock(&dm->dc_lock);
++	armed = dm->tiled_link_checks != 0;
+ 	if (dm->tiled_resync_stopping || !dc || dc->apple_5k_going_down ||
+ 	    adev->in_suspend || amdgpu_in_reset(adev)) {
+ 		if (dm->tiled_link_checks)
+@@ -16303,6 +16355,8 @@ static void amdgpu_dm_tiled_resync_work(struct work_struct *work)
+ 			dm_enable_per_frame_crtc_master_sync(dc->current_state);
+ 			dc_trigger_sync(dc, dc->current_state);
+ 		}
++		if (dc->config.apple_imac20_tiles)
++			amdgpu_dm_tiled_log_phase(adev, armed);
+ 	}
+ 	dm->tiled_sync_pending = false;
+ 	/* Read again after recovery AND timing sync. Neither an immediate lock
+diff --git a/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm_helpers.c b/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm_helpers.c
+index 4b8918332..f8dde95b0 100644
+--- a/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm_helpers.c
++++ b/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm_helpers.c
+@@ -161,6 +161,11 @@ static void dm_helpers_wire_tiled_peer(struct dc_link *link,
+ 						      DC_TILED_ROLE_ROOT;
+ 			link->tiled_pair_apple = true;
+ 			other->tiled_pair_apple = true;
++			if (link->dc->config.apple_imac20_tiles)
++				drm_info(((struct amdgpu_dm_connector *)link->priv)->base.dev,
++					 "APPLE5K: wired tile pair: root link[%u] <-> slave link[%u]\n",
++					 is_root ? link->link_index : other->link_index,
++					 is_root ? other->link_index : link->link_index);
+ 			return;
+ 		}
+ 	}
+-- 
+2.55.0
+

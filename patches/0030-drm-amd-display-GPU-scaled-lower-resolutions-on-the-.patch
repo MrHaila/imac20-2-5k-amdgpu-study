@@ -1,0 +1,394 @@
+From f19fc93335fc72de673d445f437f8d522f69a621 Mon Sep 17 00:00:00 2001
+From: Teemu Haila <teemu.haila@gmail.com>
+Date: Sun, 11 Oct 2026 19:16:44 +0300
+Subject: [PATCH 30/31] drm/amd/display: GPU-scaled lower resolutions on the
+ stitched iMac 5K panel
+
+The stitched root exposed only the 5120x2880 mode. Add the resolutions macOS
+offers on this iMac (4096x2304 ... 1280x720) plus common 16:10 and 4:3 ones.
+They keep the native stitched timing; the display scaler fits each onto the
+panel (aspect-preserving, centred). Each tile stream composes one half of the
+CRTC mode, (0,0,W/2,H), scaled onto its part of the fit rectangle
+(amdgpu_dm_tiled_stitch_split_scaling()); the plane split and the peer cursor
+shift now use that half-mode width instead of the tile timing width. For the
+native mode the result is the previous 1:1 split. mode_valid rejects a
+stitched-root mode whose stream is not on the tile timing.
+
+[adapter: iMac20 PoC, REVIEW.md L6 (fallback modes), owner request]
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.c | 233 ++++++++++++++----
+ 1 file changed, 187 insertions(+), 46 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.c b/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.c
+index 80bd6343f..c68fd761d 100644
+--- a/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.c
++++ b/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.c
+@@ -336,7 +336,13 @@ static bool amdgpu_dm_tiled_stitch_mode_is_stitched(
+ 	if (!amdgpu_dm_connector_tiled_stitch_geometry(connector, &tile_w, &tile_h))
+ 		return false;
+ 
+-	if (mode->hdisplay != 2 * tile_w || mode->vdisplay != tile_h)
++	/*
++	 * The stitched native mode, or one of the GPU-scaled modes added by
++	 * amdgpu_dm_tiled_stitch_add_scaled_modes(): no larger than the panel,
++	 * and an even width, so the source splits exactly at the seam.
++	 */
++	if (mode->hdisplay > 2 * tile_w || mode->vdisplay > tile_h ||
++	    (mode->hdisplay & 1))
+ 		return false;
+ 
+ 	list_for_each_entry(listed, &connector->probed_modes, head) {
+@@ -377,6 +383,38 @@ static bool amdgpu_dm_tiled_stitch_has_live_root_stream(
+ 	       amdgpu_dm_link_is_tiled_stitch_root(dm_old_crtc_state->stream->link);
+ }
+ 
++/*
++ * Split a stitched stream's scaling between the two tiles. On entry the
++ * stream's src is the CRTC mode (W x H, composition space) and @panel_dst is
++ * where it lands on the whole panel (2*tile_w x tile_h; the full panel for
++ * the native mode, an aspect-fit rectangle for a scaled mode). Each tile's
++ * stream then composes one half of the mode, (0,0,W/2,H), and the plane path
++ * picks the matching half of the framebuffer. The tile's dst is the part of
++ * @panel_dst that falls on that tile, in tile coordinates; DC's scaler does
++ * the rest (and draws the hardware cursor in plane space, so it scales too).
++ * For the native mode this is the 1:1 tile viewport the stitch always used.
++ */
++static void amdgpu_dm_tiled_stitch_split_scaling(struct dc_stream_state *stream,
++						 struct rect panel_dst,
++						 int tile_w, bool right)
++{
++	int x0 = right ? tile_w : 0;
++	int x1 = x0 + tile_w;
++	int left = max(panel_dst.x, x0);
++	int rgt = min(panel_dst.x + panel_dst.width, x1);
++	int w = stream->src.width, h = stream->src.height;
++
++	stream->src.x = 0;
++	stream->src.y = 0;
++	stream->src.width = w / 2;
++	stream->src.height = h;
++
++	stream->dst.x = left - x0;
++	stream->dst.y = panel_dst.y;
++	stream->dst.width = rgt > left ? rgt - left : 0;
++	stream->dst.height = panel_dst.height;
++}
++
+ /*
+  * Force a stitched root stream from the full-width CRTC mode down to the
+  * per-tile timing each DP link actually carries. The synthesized stitched
+@@ -415,9 +453,11 @@ static bool amdgpu_dm_tiled_stitch_apply_tile_timing(struct dc_stream_state *str
+ 	t->h_border_right = 0;
+ 	t->pix_clk_100hz /= 2;
+ 
+-	stream->src.x = 0; stream->src.y = 0;
+-	stream->src.width = tile_w; stream->src.height = tile_h;
+-	stream->dst = stream->src;
++	/*
++	 * update_stream_scaling_settings() ran on the full-width timing, so
++	 * src is the CRTC mode and dst its place on the whole panel.
++	 */
++	amdgpu_dm_tiled_stitch_split_scaling(stream, stream->dst, tile_w, false);
+ 
+ 	return true;
+ }
+@@ -7774,14 +7814,29 @@ static void update_stream_scaling_settings(struct drm_device *dev,
+ 	struct rect src = { 0 }; /* viewport in composition space*/
+ 	struct rect dst = { 0 }; /* stream addressable area */
+ 
++	/* Tiled stitch: a root stream already forced to the tile timing. */
++	const struct amdgpu_dm_connector *stitch_conn = NULL;
++	int stitch_tile_w = 0, stitch_tile_h = 0;
++	int panel_w;
++
+ 	/* no mode. nothing to be done */
+ 	if (!mode)
+ 		return;
+ 
++	if (stream->link && amdgpu_dm_link_is_tiled_stitch_root(stream->link) &&
++	    stream->dm_stream_context) {
++		stitch_conn = stream->dm_stream_context;
++		if (!amdgpu_dm_connector_tiled_stitch_geometry(&stitch_conn->base,
++				&stitch_tile_w, &stitch_tile_h) ||
++		    stream->timing.h_addressable != (uint32_t)stitch_tile_w)
++			stitch_conn = NULL;
++	}
++	panel_w = stream->timing.h_addressable * (stitch_conn ? 2 : 1);
++
+ 	/* Full screen scaling by default */
+ 	src.width = mode->hdisplay;
+ 	src.height = mode->vdisplay;
+-	dst.width = stream->timing.h_addressable;
++	dst.width = panel_w;
+ 	dst.height = stream->timing.v_addressable;
+ 
+ 	if (dm_state) {
+@@ -7801,7 +7856,7 @@ static void update_stream_scaling_settings(struct drm_device *dev,
+ 			dst = src;
+ 		}
+ 
+-		dst.x = (stream->timing.h_addressable - dst.width) / 2;
++		dst.x = (panel_w - dst.width) / 2;
+ 		dst.y = (stream->timing.v_addressable - dst.height) / 2;
+ 
+ 		if (dm_state->underscan_enable) {
+@@ -7816,27 +7871,18 @@ static void update_stream_scaling_settings(struct drm_device *dev,
+ 	stream->dst = dst;
+ 
+ 	/*
+-	 * Tiled stitch: each stream presents one tile of the stitched crtc mode
+-	 * 1:1 -- the plane crops the correct half of the shared framebuffer via
+-	 * its src_rect. Do NOT scale the full-width mode into the tile-wide OTG
+-	 * (the default above yields a full-width source that fails
+-	 * dce112_validate_bandwidth -> no TG -> no vblank -> flip_done
+-	 * timeouts). Force a 1:1 tile-sized stream viewport. This runs at every
+-	 * scaling update (modeset and the non-modeset paths), so it cannot be
+-	 * reset back to the stitched-width scaling on a later commit. Only
+-	 * fires once the stream timing has been forced to the tile timing
+-	 * (h_addressable == half the stitched mode); at the un-forced
+-	 * create_stream_for_sink() call the timing still matches the mode and
+-	 * amdgpu_dm_tiled_stitch_apply_tile_timing() sets src/dst itself.
++	 * Tiled stitch: each stream presents one tile -- half of the CRTC mode,
++	 * scaled onto its part of the panel (1:1 for the native stitched mode);
++	 * the plane crops the matching half of the shared framebuffer via its
++	 * src_rect. Never scale the full-width mode into the tile-wide OTG (a
++	 * full-width source fails bandwidth validation -> no TG -> no vblank ->
++	 * flip_done timeouts). This runs at every scaling update (modeset and
++	 * the non-modeset paths). It only fires once the stream timing has been
++	 * forced to the tile timing; at the un-forced create_stream_for_sink()
++	 * call amdgpu_dm_tiled_stitch_apply_tile_timing() splits instead.
+ 	 */
+-	if (stream->link && amdgpu_dm_link_is_tiled_stitch_root(stream->link) &&
+-	    mode->hdisplay == 2 * (int)stream->timing.h_addressable &&
+-	    mode->vdisplay == (int)stream->timing.v_addressable) {
+-		stream->src.x = 0; stream->src.y = 0;
+-		stream->src.width = stream->timing.h_addressable;
+-		stream->src.height = stream->timing.v_addressable;
+-		stream->dst = stream->src;
+-	}
++	if (stitch_conn)
++		amdgpu_dm_tiled_stitch_split_scaling(stream, dst, stitch_tile_w, false);
+ 
+ 	drm_dbg_kms(dev, "Destination Rectangle x:%d  y:%d  width:%d  height:%d\n",
+ 		    dst.x, dst.y, dst.width, dst.height);
+@@ -8801,8 +8847,24 @@ create_stream_for_sink(struct drm_connector *connector,
+ 			drm_mode_copy(&mode, freesync_mode);
+ 			mode.picture_aspect_ratio = saved_mode.picture_aspect_ratio;
+ 		} else {
++			/*
++			 * Tiled stitch: the scaled modes run on the native
++			 * stitched timing, copied from the preferred mode's crtc_*
++			 * fields. Those are only filled in at the end of a probe,
++			 * so mode_valid() during the probe would see zeros and
++			 * skip the copy (the mode then fails link bandwidth).
++			 * Compute them on a local copy.
++			 */
++			struct drm_display_mode stitch_native;
++			const struct drm_display_mode *native = preferred_mode;
++
++			if (amdgpu_dm_tiled_stitch_active(aconnector)) {
++				drm_mode_init(&stitch_native, preferred_mode);
++				drm_mode_set_crtcinfo(&stitch_native, 0);
++				native = &stitch_native;
++			}
+ 			decide_crtc_timing_for_drm_display_mode(
+-					&mode, preferred_mode, scale);
++					&mode, native, scale);
+ 
+ 			preferred_refresh = drm_mode_vrefresh(preferred_mode);
+ 		}
+@@ -9623,6 +9685,60 @@ static void amdgpu_dm_prefer_tile_mode(struct drm_connector *connector)
+ 			mode->type &= ~DRM_MODE_TYPE_PREFERRED;
+ }
+ 
++/*
++ * Lower resolutions on the stitched panel, the set macOS offers on this iMac
++ * plus classic 16:10 and 4:3 ones for games. They keep the native stitched
++ * timing (same clock/htotal/vtotal, so create_stream_for_sink() copies the
++ * native crtc timing) and the display scaler fits them onto the panel
++ * (aspect-preserving, centred), split per tile by
++ * amdgpu_dm_tiled_stitch_split_scaling(). Even widths only.
++ */
++static const struct amdgpu_dm_mode_size_stitch {
++	int w, h;
++} tiled_stitch_scaled_modes[] = {
++	{4096, 2304}, {3840, 2160}, {3200, 1800}, {2880, 1620}, {2560, 1440},
++	{2304, 1296}, {2048, 1152}, {1920, 1080}, {1600,  900}, {1280,  720},
++	{2560, 1600}, {1920, 1200}, {1680, 1050}, {1440,  900}, {1280,  800},
++	{1600, 1200}, {1280, 1024}, {1024,  768}, { 800,  600}, { 640,  480},
++};
++
++static int amdgpu_dm_tiled_stitch_add_scaled_modes(struct drm_connector *connector,
++						    const struct drm_display_mode *native)
++{
++	struct drm_display_mode *mode, *cur;
++	int i, added = 0;
++
++	for (i = 0; i < ARRAY_SIZE(tiled_stitch_scaled_modes); i++) {
++		int w = tiled_stitch_scaled_modes[i].w;
++		int h = tiled_stitch_scaled_modes[i].h;
++		bool exists = false;
++
++		if (w > native->hdisplay || h > native->vdisplay ||
++		    (w == native->hdisplay && h == native->vdisplay))
++			continue;
++
++		list_for_each_entry(cur, &connector->probed_modes, head) {
++			if (cur->hdisplay == w && cur->vdisplay == h) {
++				exists = true;
++				break;
++			}
++		}
++		if (exists)
++			continue;
++
++		mode = drm_mode_duplicate(connector->dev, native);
++		if (!mode)
++			continue;
++		mode->hdisplay = w;
++		mode->vdisplay = h;
++		mode->type = DRM_MODE_TYPE_DRIVER;
++		drm_mode_set_name(mode);
++		drm_mode_probed_add(connector, mode);
++		added++;
++	}
++	return added;
++}
++
+ /*
+  * Once the second tile is up and exposes its tile block, the root's EDID
+  * flips to its tile identity. Re-read it so both connectors carry the tile
+@@ -9634,9 +9750,10 @@ static void amdgpu_dm_prefer_tile_mode(struct drm_connector *connector)
+  * sync, total and pixel clock x2; vertical timing unchanged, so the refresh
+  * rate is preserved). The result is exactly halvable back to the panel's
+  * real tile timing by amdgpu_dm_tiled_stitch_apply_tile_timing(). The
+- * stitched mode becomes the only exposed mode; per-tile modes are removed
+- * because selecting one would bypass the peer stream and light only one tile.
+- * Returns the number of modes left in the probed list (0 or 1).
++ * stitched mode becomes the native (preferred) mode, plus GPU-scaled lower
++ * resolutions; per-tile modes are removed because selecting one would bypass
++ * the peer stream and light only one tile.
++ * Returns the number of modes left in the probed list.
+  */
+ static int amdgpu_dm_replace_tiled_stitch_modes(struct drm_connector *connector)
+ {
+@@ -9687,7 +9804,8 @@ static int amdgpu_dm_replace_tiled_stitch_modes(struct drm_connector *connector)
+ 		drm_info(connector->dev,
+ 			 "TILED_STITCH: kept synthesized stitched mode %s on %s (tile %dx%d)\n",
+ 			 existing_stitched->name, connector->name, tile_w, tile_h);
+-		return 1;
++		return 1 + amdgpu_dm_tiled_stitch_add_scaled_modes(connector,
++								    existing_stitched);
+ 	}
+ 
+ 	stitched = drm_mode_duplicate(connector->dev, tile_mode);
+@@ -9717,7 +9835,7 @@ static int amdgpu_dm_replace_tiled_stitch_modes(struct drm_connector *connector)
+ 		 "TILED_STITCH: exposed only stitched mode %s on %s (tile %dx%d)\n",
+ 		 stitched->name, connector->name, tile_w, tile_h);
+ 
+-	return 1;
++	return 1 + amdgpu_dm_tiled_stitch_add_scaled_modes(connector, stitched);
+ }
+ 
+ static void amdgpu_dm_reprobe_tiled_root_after_slave(struct amdgpu_device *adev)
+@@ -9959,7 +10077,21 @@ enum drm_mode_status amdgpu_dm_connector_mode_valid(struct drm_connector *connec
+ 						 to_dm_connector_state(connector->state),
+ 						 NULL);
+ 	drm_mode_destroy(connector->dev, test_mode);
+-	if (stream) {
++	if (stream && amdgpu_dm_tiled_stitch_active(aconnector) &&
++	    amdgpu_dm_connector_tiled_stitch_geometry(connector, &tile_w, &tile_h) &&
++	    stream->timing.h_addressable != (uint32_t)tile_w) {
++		/*
++		 * A stitched-root mode must end up on the per-tile timing (the
++		 * native stitched timing, halved). Anything else would drive a
++		 * non-tile timing into a panel latched in dual-tile mode.
++		 */
++		drm_dbg_kms(connector->dev,
++			 "TILED_STITCH: mode_valid reject %s: stream timing %ux%u is not the tile timing\n",
++			 mode->name, stream->timing.h_addressable,
++			 stream->timing.v_addressable);
++		dc_stream_release(stream);
++		result = MODE_PANEL;
++	} else if (stream) {
+ 		dc_stream_release(stream);
+ 		result = MODE_OK;
+ 	} else if (amdgpu_dm_is_tiled_slave(aconnector) &&
+@@ -11610,8 +11742,8 @@ static void amdgpu_dm_tiled_peer_cursor_pos(const struct dc_stream_state *peer,
+ 		const struct dc_cursor_position *root_pos,
+ 		struct dc_cursor_position *pos)
+ {
+-	/* The peer stream carries the tile timing (cloned from the root). */
+-	int tile_w = peer->timing.h_addressable;
++	/* The peer composes the right half of the CRTC mode (src.width wide). */
++	int tile_w = peer->src.width;
+ 	int max_cursor = peer->ctx->dc->caps.max_cursor_size;
+ 	int x = (int)root_pos->x - tile_w;
+ 
+@@ -11992,9 +12124,10 @@ static void amdgpu_dm_commit_planes(struct drm_atomic_commit *state,
+ 		if (acrtc_state->stream_peer && dm_new_plane_state->dc_state_peer &&
+ 		    plane == pcrtc->primary && new_plane_state->fb &&
+ 		    new_plane_state->fb->width >=
+-			    2 * acrtc_state->stream->timing.h_addressable) {
+-			int tile_w = acrtc_state->stream->timing.h_addressable;
+-			int tile_h = acrtc_state->stream->timing.v_addressable;
++			    2 * acrtc_state->stream->src.width) {
++			/* Half of the CRTC mode: the tile stream's composition space. */
++			int tile_w = acrtc_state->stream->src.width;
++			int tile_h = acrtc_state->stream->src.height;
+ 
+ 			/* Copy first (keeps scaling_quality etc.), then reconcile
+ 			 * all rects (incl. clip) to tile stream space. */
+@@ -13755,10 +13888,17 @@ create_tiled_peer_stream(struct dc *dc, struct dc_state *context,
+ 	/* No drm connector backs the peer; it is internal to the root crtc. */
+ 	peer->dm_stream_context = NULL;
+ 
+-	/* Both tiles are timing-identical; mirror the validated root stream. */
++	/*
++	 * Both tiles are timing-identical; mirror the validated root stream.
++	 * The root shows the left half of the mode and the peer the right half
++	 * (same src size). The fit rectangle is centred on the panel, so the
++	 * right tile's dst mirrors the left one's about the seam: it starts at
++	 * the seam (x 0) with the same width.
++	 */
+ 	peer->timing = root_stream->timing;
+ 	peer->src = root_stream->src;
+ 	peer->dst = root_stream->dst;
++	peer->dst.x = 0;
+ 	peer->output_color_space = root_stream->output_color_space;
+ 
+ 	return peer;
+@@ -14113,10 +14253,10 @@ static int dm_update_crtc_state(struct amdgpu_display_manager *dm,
+ 			 */
+ 			if (amdgpu_dm_link_is_tiled_stitch_root(new_stream->link) &&
+ 			    !dm_new_crtc_state->stream_peer &&
+-			    new_crtc_state->mode.hdisplay ==
+-				    2 * (int)new_stream->timing.h_addressable &&
+-			    new_crtc_state->mode.vdisplay ==
+-				    (int)new_stream->timing.v_addressable) {
++			    amdgpu_dm_connector_tiled_stitch_geometry(connector,
++							&tile_w, &tile_h) &&
++			    new_stream->timing.h_addressable == (uint32_t)tile_w &&
++			    new_stream->timing.v_addressable == (uint32_t)tile_h) {
+ 				struct dc_stream_state *peer =
+ 					create_tiled_peer_stream(dm->dc,
+ 						dm_state->context, new_stream);
+@@ -14737,9 +14877,10 @@ static int dm_update_plane_state(struct dc *dc,
+ 		    dm_new_crtc_state->stream &&
+ 		    new_plane_state->fb &&
+ 		    new_plane_state->fb->width >=
+-			    2 * dm_new_crtc_state->stream->timing.h_addressable) {
+-			int tile_w = dm_new_crtc_state->stream->timing.h_addressable;
+-			int tile_h = dm_new_crtc_state->stream->timing.v_addressable;
++			    2 * dm_new_crtc_state->stream->src.width) {
++			/* Half of the CRTC mode: the tile stream's composition space. */
++			int tile_w = dm_new_crtc_state->stream->src.width;
++			int tile_h = dm_new_crtc_state->stream->src.height;
+ 			struct dc_plane_state *peer_plane = dc_create_plane_state(dc);
+ 
+ 			if (!peer_plane) {
+-- 
+2.55.0
+

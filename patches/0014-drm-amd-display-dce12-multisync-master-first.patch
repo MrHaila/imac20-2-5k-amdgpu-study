@@ -1,0 +1,64 @@
+From 92ef2cb752ff06793ec6124203e5c39d36102a6b Mon Sep 17 00:00:00 2001
+From: Teemu Haila <teemu.haila@gmail.com>
+Date: Sat, 10 Oct 2026 20:45:47 +0300
+Subject: [PATCH 14/31] drm/amd/display: dce12-multisync-master-first
+
+[upstream: imac5k-universal-linux-patcher patches/dce12-multisync-master-first.patch @ c1086d2b438c]
+Applied unchanged with patch -p1 onto v7.2.9-arch1 + probe-defer.
+
+(The upstream patch carries no description; see its in-code comments.)
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01SUvgXxxT5Apr7YLjKZVd2T
+---
+ drivers/gpu/drm/amd/display/dc/core/dc.c | 27 +++++++++++++++++++++++-
+ 1 file changed, 26 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/gpu/drm/amd/display/dc/core/dc.c b/drivers/gpu/drm/amd/display/dc/core/dc.c
+index ebfed18e7..6939a60c6 100644
+--- a/drivers/gpu/drm/amd/display/dc/core/dc.c
++++ b/drivers/gpu/drm/amd/display/dc/core/dc.c
+@@ -1617,6 +1617,30 @@ static void enable_timing_multisync(
+ 	int i, multisync_count = 0;
+ 	int pipe_count = dc->res_pool->pipe_count;
+ 	struct pipe_ctx *multisync_pipes[MAX_PIPES] = { NULL };
++	/*
++	 * DCE 12 (Vega): put the master pipe first. Its hwseq,
++	 * dce110_enable_per_frame_crtc_position_reset(), takes the GSL master
++	 * from grouped_pipes[0] and arms grouped_pipes[1..]; handed only the
++	 * slaves, GSL group 0 gets no master and the armed slaves wait on a
++	 * trigger nothing generates ("GSL: Timeout on reset trigger!"). Other
++	 * generations keep the slaves-only list: DCN arms every entry from 0.
++	 */
++	bool master_first = dc->ctx->dce_version == DCE_VERSION_12_0;
++
++	if (master_first) {
++		for (i = 0; i < pipe_count; i++) {
++			if (!ctx->res_ctx.pipe_ctx[i].stream ||
++					!ctx->res_ctx.pipe_ctx[i].stream->triggered_crtc_reset.enabled)
++				continue;
++			if (ctx->res_ctx.pipe_ctx[i].stream != ctx->res_ctx.pipe_ctx[i].stream->triggered_crtc_reset.event_source)
++				continue;
++			multisync_pipes[0] = &ctx->res_ctx.pipe_ctx[i];
++			multisync_count = 1;
++			break;
++		}
++		if (multisync_count == 0)
++			return;
++	}
+ 
+ 	for (i = 0; i < pipe_count; i++) {
+ 		if (!ctx->res_ctx.pipe_ctx[i].stream ||
+@@ -1628,7 +1652,8 @@ static void enable_timing_multisync(
+ 		multisync_count++;
+ 	}
+ 
+-	if (multisync_count > 0) {
++	/* With the master in slot 0, at least one slave must have joined it. */
++	if (multisync_count > (master_first ? 1 : 0)) {
+ 		dc->hwss.enable_per_frame_crtc_position_reset(
+ 			dc, multisync_count, multisync_pipes);
+ 	}
+-- 
+2.55.0
+

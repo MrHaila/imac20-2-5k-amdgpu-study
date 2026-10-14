@@ -1,0 +1,59 @@
+From 71924d1a017e1b0418b1ac93ab64e56b41f3f22e Mon Sep 17 00:00:00 2001
+From: Teemu Haila <teemu.haila@gmail.com>
+Date: Sat, 10 Oct 2026 20:45:47 +0300
+Subject: [PATCH 15/31] drm/amd/display: dce110-genlock-master-from-pipe0
+
+[upstream: imac5k-universal-linux-patcher patches/dce110-genlock-master-from-pipe0.patch @ c1086d2b438c]
+Applied unchanged with patch -p1 onto v7.2.9-arch1 + probe-defer.
+
+(The upstream patch carries no description; see its in-code comments.)
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01SUvgXxxT5Apr7YLjKZVd2T
+---
+ .../amd/display/dc/hwss/dce110/dce110_hwseq.c | 20 +++++++++++++++----
+ 1 file changed, 16 insertions(+), 4 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/display/dc/hwss/dce110/dce110_hwseq.c b/drivers/gpu/drm/amd/display/dc/hwss/dce110/dce110_hwseq.c
+index f5b3a2eff..5138010f7 100644
+--- a/drivers/gpu/drm/amd/display/dc/hwss/dce110/dce110_hwseq.c
++++ b/drivers/gpu/drm/amd/display/dc/hwss/dce110/dce110_hwseq.c
+@@ -2986,7 +2986,17 @@ static void dce110_enable_per_frame_crtc_position_reset(
+ 	DC_LOGGER_INIT(dc->ctx);
+ 
+ 	gsl_params.gsl_group = 0;
++	/*
++	 * When enable_timing_multisync() put the master pipe first (DCE 12),
++	 * make it the GSL master: setup_global_swap_lock() sets
++	 * DCP_GSL_MASTER_EN only on the pipe whose tg->inst matches, as
++	 * dce110_enable_timing_synchronization() above already relies on. A
++	 * slaves-only list keeps the historical 0.
++	 */
+ 	gsl_params.gsl_master = 0;
++	if (grouped_pipes[0]->stream ==
++	    grouped_pipes[0]->stream->triggered_crtc_reset.event_source)
++		gsl_params.gsl_master = grouped_pipes[0]->stream_res.tg->inst;
+ 
+ 	for (i = 0; i < group_size; i++)
+ 		grouped_pipes[i]->stream_res.tg->funcs->setup_global_swap_lock(
+@@ -2994,11 +3004,13 @@ static void dce110_enable_per_frame_crtc_position_reset(
+ 
+ 	DC_SYNC_INFO("GSL: enabling trigger-reset\n");
+ 
++	/* Index 0 is the master when there is one; it drives the trigger. */
+ 	for (i = 1; i < group_size; i++)
+-		grouped_pipes[i]->stream_res.tg->funcs->enable_crtc_reset(
+-				grouped_pipes[i]->stream_res.tg,
+-				gsl_params.gsl_master,
+-				&grouped_pipes[i]->stream->triggered_crtc_reset);
++		if (grouped_pipes[i]->stream_res.tg->funcs->enable_crtc_reset)
++			grouped_pipes[i]->stream_res.tg->funcs->enable_crtc_reset(
++					grouped_pipes[i]->stream_res.tg,
++					gsl_params.gsl_master,
++					&grouped_pipes[i]->stream->triggered_crtc_reset);
+ 
+ 	DC_SYNC_INFO("GSL: waiting for reset to occur.\n");
+ 	for (i = 1; i < group_size; i++)
+-- 
+2.55.0
+
