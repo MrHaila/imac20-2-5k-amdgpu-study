@@ -21,7 +21,7 @@ other people can read it, test it, or take parts of it.
   macOS joins them. On Linux you get two separate displays, or a 4K picture.
 - **What this does.** The kernel drives both halves and shows Hyprland **one** 5120×2880
   monitor. No compositor patch is needed.
-- **Status so far.** One iMac20,2 (Radeon Pro 5700), `linux-t2` 7.2.9, Hyprland (Omarchy) tested to work well enough for my daily use. Code is unaudited.
+- **Status so far.** One iMac20,2 (Radeon Pro 5700), `linux-t2` 7.2.11, Hyprland (Omarchy) tested to work well enough for my daily use. Code is unaudited.
 
 
 ## Two builds: "default" and "candidate"
@@ -30,11 +30,11 @@ You will see these two words in all documents here. They are my own names, so he
 
 | Name | Patches | In plain words |
 |---|---|---|
-| **Default build** | `0001`–`0033` | The build **I use every day** on my iMac. I installed it as my real graphics driver on 2026-10-12. "Default" means "the one my machine boots by default". It does **not** mean "official release". **If you only try one thing, try this.** |
-| **Candidate build** | `0001`–`0037` | The default build **plus four more patches** (`0034`–`0037`). The four patches fix problems that I already knew about (see the table below). It passed my automated tests, but I have **not lived with it yet**, and one of its fixes has only been tested with simulated failures. I am waiting to see if it holds up before I make it my default. |
+| **Default build** | `0001`–`0032` | The build **I use every day** on my iMac. I installed it as my real graphics driver on 2026-10-12. "Default" means "the one my machine boots by default". It does **not** mean "official release". **If you only try one thing, try this.** |
+| **Candidate build** | `0001`–`0036` | The default build **plus four more patches** (`0033`–`0036`). The four patches fix problems that I already knew about (see the table below). It passed my automated tests, but I have **not lived with it yet**, and one of its fixes has only been tested with simulated failures. I am waiting to see if it holds up before I make it my default. |
 
-You choose the build when you apply the patches: the first 33 patches for the default build,
-all 37 for the candidate. [docs/TESTING.md](docs/TESTING.md) shows the exact commands.
+You choose the build when you apply the patches: the first 32 patches for the default build,
+all 36 for the candidate. [docs/TESTING.md](docs/TESTING.md) shows the exact commands.
 
 In short: **the default is the one I trust more. The candidate is the one I think is better.**
 
@@ -42,12 +42,12 @@ In short: **the default is the one I trust more. The candidate is the one I thin
 
 | Problem in the default build | Candidate |
 |---|---|
-| On about 1 display wake in 25, the left half shows stretched over the whole panel for under a second. It heals by itself. | Not seen in 130 wakes (patch `0037`) |
-| If the second half of the panel were lost for good, the right half of the desktop would stay dark until reboot. I have **never** seen this on real hardware. It comes from a code review. | The kernel retries by itself (`0034`). If that fails, it squeezes the whole desktop onto the left half, and the panel stretches it back (`0035`). Tested only with **simulated** failures (`0036` adds the test switch) |
+| On about 1 display wake in 25, the left half shows stretched over the whole panel for under a second. It heals by itself. | Not seen in 130 wakes (patch `0036`) |
+| If the second half of the panel were lost for good, the right half of the desktop would stay dark until reboot. I have **never** seen this on real hardware. It comes from a code review. | The kernel retries by itself (`0033`). If that fails, it squeezes the whole desktop onto the left half, and the panel stretches it back (`0034`). Tested only with **simulated** failures (`0035` adds the test switch) |
 
 ### Results in short
 
-All numbers: one iMac20,2, `linux-t2` 7.2.9, Hyprland. The details, the method and what was
+All numbers: one iMac20,2, `linux-t2` 7.2, Hyprland. The details, the method and what was
 **not** measured are in [docs/RESULTS.md](docs/RESULTS.md).
 
 | Check | Default build | Candidate build |
@@ -59,8 +59,8 @@ All numbers: one iMac20,2, `linux-t2` 7.2.9, Hyprland. The details, the method a
 | Mode switches (2560×1440 and back) | 20 of 20 (earlier build) | 10 of 10 |
 | Longest soak | 2 hours (earlier build) | none |
 
-"Earlier build" means the first stitched build, patches `0001`–`0031`. It has the same stitch code. It was my daily
-driver for part of 2026-10-12, before the GPU fix `0032` was added.
+"Earlier build" means the first stitched build, patches `0001`–`0030`. It has the same stitch code. It was my daily
+driver for part of 2026-10-12, before the GPU fix `0031` was added.
 
 ## What problem this addresses
 
@@ -74,7 +74,7 @@ The patches here make the kernel join the halves. Hyprland then sees one ordinar
 
 There is a second, separate problem in the same machine. On about half of all boots, `amdgpu`
 fails to start the GPU, because Apple's firmware leaves the GPU in a state that the driver
-does not expect. Patches `0032` and `0033` deal with it. See
+does not expect. Patches `0031` and `0032` deal with it. See
 [docs/FOR-T2LINUX.md](docs/FOR-T2LINUX.md).
 
 ## What this is based on
@@ -86,7 +86,7 @@ it to the iMac20,2 (Radeon Pro 5700, Navi 10, display engine DCN 2.0).
 |---|---|---|
 | [`MarkPronkin/imac5k-universal-linux-patcher`](https://github.com/MarkPronkin/imac5k-universal-linux-patcher) (commit `c1086d2b438c`) | The "lean core" and the "stitch layer", and 10 more patches. This repository is a fork of Ahmad Al-Awadi's [`ahmadtv/omarchy-imac18-3-patch`](https://github.com/ahmadtv/omarchy-imac18-3-patch). Both build on community work in [drm/amd#4455](https://gitlab.freedesktop.org/drm/amd/-/issues/4455): mforce2 (second-tile wake), erik2 (stitch) and taprobane99 (7.2.2 port) | MIT |
 | [`BR1UHNz/retina-5k-imac-linux`](https://github.com/BR1UHNz/retina-5k-imac-linux) (commit `6977710`) | Fixes on top of that stack: stitch gate, plane checks, link lifecycle (including the wake-up of the second tile after power-down), genlock | GPL-2.0 |
-| [`t2linux/linux-t2-patches`](https://github.com/t2linux/linux-t2-patches) (commit `65fdd4d`) | The amdgpu parts of three patches (`2009`, `6001`, `7002`), which the shipped `linux-t2` module already contains. Also the first 5K support (`7003`, by Atharva Tiwari). It gives two connectors, it showed that the panel can be driven, and it found that the GPU must set up the display block **before** the power controller. Patch `0032` is that one hunk | GPL-2.0 |
+| [`t2linux/linux-t2-patches`](https://github.com/t2linux/linux-t2-patches) (commit `e167207`) | The amdgpu parts of two patches (`2009`, `6001`), which the shipped `linux-t2` module already contains. Also the first 5K support (`7003`, by Atharva Tiwari). It gives two connectors, it showed that the panel can be driven, and it found that the GPU must set up the display block **before** the power controller. Patch `0031` is that one hunk | GPL-2.0 |
 | [`edschofield`](https://github.com/t2linux/wiki/issues/743) | Not code that I used. His iMac20,1 tests and traces in t2linux/wiki#743 confirmed my findings independently, and sharpened them. His [Aquamarine patch](https://github.com/edschofield/aquamarine/tree/imac5k-development) is the userspace alternative to my kernel approach | — |
 | Alex Deucher (AMD) in [drm/amd#5726](https://gitlab.freedesktop.org/drm/amd/-/work_items/5726) | The direction for the probe fix, through his reference commit `a5be7ad8f5f0` | — |
 
@@ -99,22 +99,22 @@ git author on the patches is the person who ran `git am`. It is not the original
 
 ## What is new here
 
-[docs/PATCH-MAP.md](docs/PATCH-MAP.md) lists all 37 patches with origin, size and status. In groups:
+[docs/PATCH-MAP.md](docs/PATCH-MAP.md) lists all 36 patches with origin, size and status. In groups:
 
 | Patches | What | Origin |
 |---|---|---|
-| `0001`–`0003` | The amdgpu parts of three t2linux patches | t2linux |
-| `0004` | Probe deferral: retry a failed first probe once. **Now a fallback that never fires** on this machine, because `0032` cures the cause. Sent to amd-gfx on 2026-09-26 | Mine |
-| `0005`–`0021` | The community stitch stack, **unchanged** | Pronkin, br1uhnz |
-| `0022`–`0027` | Wiring for this machine: a gate so that only iMac20,x runs the tile code, and the glue for the newer display engine (DCN) | Mine |
-| `0028`–`0031` | Fixes that testing found: a cursor locking bug, a wake-up ordering bug, a lower-resolution mode set, a deadlock | Mine |
-| `0032`, `0033` | The GPU start-up fix, and a small bug fix in the compute driver (KFD) | `0032`: Atharva Tiwari's hunk. `0033`: mine |
-| `0034`–`0037` | **The candidate patches** | Mine |
+| `0001`, `0002` | The amdgpu parts of two t2linux patches | t2linux |
+| `0003` | Probe deferral: retry a failed first probe once. **Now a fallback that never fires** on this machine, because `0031` cures the cause. Sent to amd-gfx on 2026-09-26 | Mine |
+| `0004`–`0020` | The community stitch stack, **unchanged** | Pronkin, br1uhnz |
+| `0021`–`0026` | Wiring for this machine: a gate so that only iMac20,x runs the tile code, and the glue for the newer display engine (DCN) | Mine |
+| `0027`–`0030` | Fixes that testing found: a cursor locking bug, a wake-up ordering bug, a lower-resolution mode set, a deadlock | Mine |
+| `0031`, `0032` | The GPU start-up fix, and a small bug fix in the compute driver (KFD) | `0031`: Atharva Tiwari's hunk. `0032`: mine |
+| `0033`–`0036` | **The candidate patches** | Mine |
 
 ## Limits of the evidence
 
 - **One machine.** One iMac20,2 with a Radeon Pro 5700. Nobody else has run this.
-- **One kernel.** `linux-t2` 7.2.9. The series applies to 7.2.10 with patch `0003` dropped, but I have not built or booted that.
+- **One kernel line.** I run the default build on `linux-t2` 7.2.11. The measured results come from an earlier 7.2 point release with the same patches. On 7.2.11 the default has my daily boots behind it, not a new test campaign, and the candidate is built but not yet booted.
 - **One compositor.** Hyprland.
 - **Not tested yet:** iMac20,1, other GPUs, a 24-hour soak, GPU-reset recovery, a screen locker.
 
@@ -139,7 +139,7 @@ Start here, in this order:
 
 | Path | Content |
 |---|---|
-| `patches/` | The 37 patches, in order. Apply them to Arch tag `v7.2.9-arch1` |
+| `patches/` | The 36 patches, in order. Apply them to Arch tag `v7.2.11-arch1` |
 | `docs/TESTING.md` | Build, install, verify, roll back, report |
 | `docs/RESULTS.md` | The measured results |
 | `docs/KNOWN-ISSUES.md` | What is wrong or unknown |

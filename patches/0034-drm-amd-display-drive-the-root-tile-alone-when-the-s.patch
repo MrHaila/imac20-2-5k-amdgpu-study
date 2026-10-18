@@ -1,0 +1,368 @@
+From 959ac25ffffc8d303e269c89db61f871f4a80c72 Mon Sep 17 00:00:00 2001
+From: Teemu Haila <teemu.haila@gmail.com>
+Date: Mon, 12 Oct 2026 21:57:14 +0300
+Subject: [PATCH 34/36] drm/amd/display: drive the root tile alone when the
+ second is lost for good (L6)
+
+Once latched, the stitch stays active for the boot. If the second tile
+stops training for good (create_tiled_peer_stream() returns NULL, or link
+1 never trains), the root keeps its 5120-wide mode and the panel shows
+only the left 2560 columns of the desktop; the right half is invisible.
+
+Changing what userspace sees does not help: Hyprland ignored a mode-list
+change plus hotplug event in testing (run 090) and kept 5120x2880, and
+any later commit of that mode must still work, or a DPMS-on leaves the
+panel black. So keep everything userspace sees as it is (stitch roles,
+synthetic EDID, mode list, TILE blob, non-desktop slave) and change only
+how the root drives the panel.
+
+When the kernel modesets of the previous commit do not bring the second
+tile back and the root link itself is fine, set tiled_stitch_fallback on
+the root connector and force a root commit. In the fallback a stitched
+mode (5120x2880 or one of the GPU-scaled modes) drives the root tile
+alone: no peer stream and so no plane split; the root stream keeps the
+native 2560-wide tile timing, src is the full mode, and dst is the
+mode's aspect-fit rectangle on the whole panel with x and width halved.
+With only link 0 lit and the 0x4F1 latch held (a slave stream-off does
+not clear it), the TCON stretches the root tile horizontally over the
+whole panel (run 041), so the panel undoes the 2:1 squeeze: the user sees
+the complete desktop with the right geometry at half the horizontal
+resolution. DCN 2.0 allows it statically: plane_cap max_downscale_factor
+argb8888 = 250 (4:1), debug.max_downscale_src_width = 5120 (the check is
+"> 5120"); DML decides on DPPCLK/pipe split at atomic check. If the
+fallback commit fails, the flag is cleared again and the stitch stays as
+it was.
+
+Link health is not armed in the fallback (a root lit alone is its normal
+state, not a failure).
+
+Re-latch: the second tile's next HPD with a sink, at least 60 s after the
+fallback and at most twice per boot, clears the flag and forces a root
+commit; the stitched path re-adds the peer stream and re-arms link
+health. The mode never changed, so that commit is valid. Link 1 is not
+driven in the fallback, so that HPD is not expected while the panel just
+runs: the likely trigger is a DPMS cycle or resume, where the root's D3
+drops the latch and its re-enable writes it again, which pulses the
+second tile's HPD.
+
+No new DPCD writes. A bad root still goes to the compositor as
+link-status BAD, as before.
+
+[adapter: iMac20 PoC, REVIEW.md L6]
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.c | 186 ++++++++++++++++--
+ .../gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.h |  11 ++
+ 2 files changed, 186 insertions(+), 11 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.c b/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.c
+index 162fab2dd..1f750a476 100644
+--- a/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.c
++++ b/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.c
+@@ -244,6 +244,24 @@ static bool amdgpu_dm_link_is_tiled_stitch_slave(const struct dc_link *link)
+ 	       amdgpu_dm_link_tiled_stitch_enabled(link);
+ }
+ 
++/*
++ * Single-tile fallback (see amdgpu_dm_tiled_recover_work()): the second tile
++ * is lost for good, so the stitched root drives its own tile alone, with the
++ * whole CRTC mode squeezed into it. Userspace sees no change: the stitch
++ * roles, the mode list and both connectors stay exactly as they are. Only
++ * the peer stream, the plane split and link health are off.
++ */
++static bool amdgpu_dm_link_tiled_stitch_fallback(const struct dc_link *link)
++{
++	const struct amdgpu_dm_connector *rconn;
++
++	if (!amdgpu_dm_link_tiled_stitch_enabled(link))
++		return false;
++	rconn = link->tiled_role == DC_TILED_ROLE_ROOT ? link->priv :
++							 link->tiled_peer->priv;
++	return rconn && READ_ONCE(rconn->tiled_stitch_fallback);
++}
++
+ /*
+  * Tile geometry of a stitchable connector: exactly two side-by-side tiles
+  * of one monitor. Fills the per-tile size from the DisplayID tile block.
+@@ -416,6 +434,25 @@ static void amdgpu_dm_tiled_stitch_split_scaling(struct dc_stream_state *stream,
+ 	stream->dst.height = panel_dst.height;
+ }
+ 
++/*
++ * Single-tile fallback: the root tile alone shows the whole CRTC mode. With
++ * only link 0 lit and the dual-tile latch held, the TCON stretches the root
++ * tile horizontally over the whole panel (run 041), so squeeze the mode 2:1
++ * into the tile and the panel undoes it: the user sees the complete desktop,
++ * correct geometry, half the horizontal resolution. src stays the full mode
++ * (one plane, no split); dst is @panel_dst, its place on the whole panel,
++ * halved horizontally. DC's scaler does the rest (DCN 2.0: up to 4:1 down,
++ * source width up to 5120).
++ */
++static void amdgpu_dm_tiled_stitch_squeeze_scaling(struct dc_stream_state *stream,
++						   struct rect panel_dst)
++{
++	stream->dst.x = panel_dst.x / 2;
++	stream->dst.y = panel_dst.y;
++	stream->dst.width = panel_dst.width / 2;
++	stream->dst.height = panel_dst.height;
++}
++
+ /*
+  * Force a stitched root stream from the full-width CRTC mode down to the
+  * per-tile timing each DP link actually carries. The synthesized stitched
+@@ -458,7 +495,10 @@ static bool amdgpu_dm_tiled_stitch_apply_tile_timing(struct dc_stream_state *str
+ 	 * update_stream_scaling_settings() ran on the full-width timing, so
+ 	 * src is the CRTC mode and dst its place on the whole panel.
+ 	 */
+-	amdgpu_dm_tiled_stitch_split_scaling(stream, stream->dst, tile_w, false);
++	if (amdgpu_dm_link_tiled_stitch_fallback(stream->link))
++		amdgpu_dm_tiled_stitch_squeeze_scaling(stream, stream->dst);
++	else
++		amdgpu_dm_tiled_stitch_split_scaling(stream, stream->dst, tile_w, false);
+ 
+ 	return true;
+ }
+@@ -5464,6 +5504,72 @@ static void hdmi_hpd_debounce_work(struct work_struct *work)
+ 	}
+ }
+ 
++/*
++ * The second tile regained its sink while its root is in the single-tile
++ * fallback: re-latch the stitch. Not within APPLE5K_RELATCH_MIN_MS of the
++ * fallback and at most APPLE5K_RELATCH_MAX times per boot, so a tile that
++ * keeps dropping out cannot keep the panel in modesets. The mode never
++ * changed, so a forced root commit is all it takes: the stitched path re-adds
++ * the peer stream and re-arms link health. A DPMS-off CRTC only gets the flag
++ * cleared; its next DPMS-on is a stitched modeset.
++ *
++ * Link 1 is not driven in the fallback, so this HPD should not come while the
++ * panel just runs: the expected trigger is a DPMS cycle (or resume), where
++ * the root's D3 drops the dual-tile latch and its re-enable writes it again,
++ * which pulses the second tile's HPD.
++ */
++static void amdgpu_dm_tiled_relatch(struct amdgpu_device *adev,
++				    struct amdgpu_dm_connector *root)
++{
++	struct drm_device *dev = adev_to_drm(adev);
++	struct drm_crtc *crtc = NULL;
++	const struct dm_crtc_state *cs = NULL;
++	unsigned int since_ms;
++	bool relatch = false;
++	u8 count;
++	int ret;
++
++	drm_modeset_lock_all(dev);
++	mutex_lock(&adev->dm.dc_lock);
++	count = root->tiled_relatch_count;
++	since_ms = jiffies_to_msecs(jiffies - root->tiled_fallback_jiffies);
++	if (READ_ONCE(root->tiled_stitch_fallback) &&
++	    since_ms >= APPLE5K_RELATCH_MIN_MS && count < APPLE5K_RELATCH_MAX) {
++		root->tiled_relatch_count = ++count;
++		adev->dm.tiled_kmodeset_tries = 0;
++		WRITE_ONCE(root->tiled_stitch_fallback, false);
++		relatch = true;
++	}
++	mutex_unlock(&adev->dm.dc_lock);
++
++	if (!relatch) {
++		drm_info(dev, "APPLE5K: second tile back; staying on one tile (re-latches %u/%u, %u s since fallback)\n",
++			 count, APPLE5K_RELATCH_MAX, since_ms / 1000);
++		goto unlock;
++	}
++	drm_info(dev, "APPLE5K: second tile back; re-latching the stitch (%u/%u)\n",
++		 count, APPLE5K_RELATCH_MAX);
++
++	if (root->base.encoder)
++		crtc = root->base.encoder->crtc;
++	if (crtc && crtc->state)
++		cs = to_dm_crtc_state(crtc->state);
++	if (!cs || !crtc->state->active || !cs->stream || cs->stream->dpms_off)
++		goto unlock;
++
++	ret = dm_force_atomic_commit(&root->base);
++	if (ret) {
++		/* The root still runs alone; keep the flag consistent with it. */
++		mutex_lock(&adev->dm.dc_lock);
++		WRITE_ONCE(root->tiled_stitch_fallback, true);
++		mutex_unlock(&adev->dm.dc_lock);
++		drm_err(dev, "APPLE5K: stitch re-latch commit failed: %d; staying on one tile\n",
++			ret);
++	}
++unlock:
++	drm_modeset_unlock_all(dev);
++}
++
+ /*
+  * The second tile of a stitched Apple 5K panel just (re)gained its sink
+  * through HPD. Its connector is non-desktop, so the compositor never reacts
+@@ -5488,6 +5594,11 @@ static void amdgpu_dm_tiled_slave_sink_gained(struct amdgpu_device *adev,
+ 	if (!root)
+ 		return;
+ 
++	if (amdgpu_dm_link_tiled_stitch_fallback(link)) {
++		amdgpu_dm_tiled_relatch(adev, root);
++		return;
++	}
++
+ 	amdgpu_dm_reprobe_tiled_root_after_slave(adev);
+ 
+ 	drm_modeset_lock_all(dev);
+@@ -7961,8 +8072,12 @@ static void update_stream_scaling_settings(struct drm_device *dev,
+ 	 * the non-modeset paths). It only fires once the stream timing has been
+ 	 * forced to the tile timing; at the un-forced create_stream_for_sink()
+ 	 * call amdgpu_dm_tiled_stitch_apply_tile_timing() splits instead.
++	 * The single-tile fallback is the one exception: there the root
++	 * stream deliberately squeezes the whole mode into its tile.
+ 	 */
+-	if (stitch_conn)
++	if (stitch_conn && amdgpu_dm_link_tiled_stitch_fallback(stream->link))
++		amdgpu_dm_tiled_stitch_squeeze_scaling(stream, dst);
++	else if (stitch_conn)
+ 		amdgpu_dm_tiled_stitch_split_scaling(stream, dst, stitch_tile_w, false);
+ 
+ 	drm_dbg_kms(dev, "Destination Rectangle x:%d  y:%d  width:%d  height:%d\n",
+@@ -14354,9 +14469,11 @@ static int dm_update_crtc_state(struct amdgpu_display_manager *dm,
+ 			 * Refcounting mirrors the root stream above exactly.
+ 			 * The root connector exposes only the stitched (2x tile)
+ 			 * mode; the size check is defensive against stale or
+-			 * forced non-stitched modes.
++			 * forced non-stitched modes. None in the single-tile
++			 * fallback: the root then shows the whole mode alone.
+ 			 */
+ 			if (amdgpu_dm_link_is_tiled_stitch_root(new_stream->link) &&
++			    !amdgpu_dm_link_tiled_stitch_fallback(new_stream->link) &&
+ 			    !dm_new_crtc_state->stream_peer &&
+ 			    amdgpu_dm_connector_tiled_stitch_geometry(connector,
+ 							&tile_w, &tile_h) &&
+@@ -16369,6 +16486,12 @@ static bool amdgpu_dm_tiled_check_links(struct amdgpu_device *adev)
+ 		else if (amdgpu_dm_link_is_tiled_stitch_slave(link))
+ 			slave = link;
+ 	}
++	/* No second tile to check; a GPU reset arms the checks regardless. */
++	if (root && amdgpu_dm_link_tiled_stitch_fallback(root)) {
++		drm_info(adev_to_drm(adev),
++			 "APPLE5K: link-health disarmed: single-tile fallback\n");
++		return false;
++	}
+ 	if (!root || !slave || root->tiled_peer != slave || slave->tiled_peer != root) {
+ 		drm_warn(adev_to_drm(adev),
+ 			 "APPLE5K: link-health disarmed: no active tiled pair root=%d slave=%d paired=%d streams=%u\n",
+@@ -16493,8 +16616,10 @@ static void amdgpu_dm_tiled_request_full_modeset(struct amdgpu_device *adev)
+  *
+  * Lock order as in the commit path: modeset locks, then dc_lock (never held
+  * across the commit). Bounded to APPLE5K_KMODESET_MAX in a row, reset by a
+- * passing sequence, and by the link-status budget. A root link that stays bad
+- * then goes to the compositor as link status BAD, the old behaviour.
++ * passing sequence, and by the link-status budget. Then a second tile that
++ * stays down puts the root into its single-tile fallback, and a root link
++ * that stays bad goes to the compositor as link status BAD, the old
++ * behaviour.
+  */
+ static void amdgpu_dm_tiled_recover_work(struct work_struct *work)
+ {
+@@ -16523,7 +16648,8 @@ static void amdgpu_dm_tiled_recover_work(struct work_struct *work)
+ 			break;
+ 		}
+ 	}
+-	if (!root)
++	/* Already on one tile: nothing left to recover. */
++	if (!root || amdgpu_dm_link_tiled_stitch_fallback(root->dc_link))
+ 		goto unlock;
+ 
+ 	/*
+@@ -16586,12 +16712,37 @@ static void amdgpu_dm_tiled_recover_work(struct work_struct *work)
+ 		}
+ 		goto unlock;
+ 	}
++	if (fail_root) {
++		mutex_unlock(&dm->dc_lock);
++		request_bad = true;
++		goto unlock;
++	}
++
++	/*
++	 * The kernel modesets did not bring the second tile back, but the root
++	 * link is fine (L6): drive the root tile alone rather than leave the
++	 * right half of the desktop invisible. Nothing userspace sees changes
++	 * (it may never re-probe: Hyprland kept its 5120 mode across a hotplug
++	 * in run 090); the root stream squeezes the compositor's current mode
++	 * into its tile instead (amdgpu_dm_tiled_stitch_squeeze_scaling()).
++	 * The forced commit makes it take effect at once; the CRTC is active
++	 * here, as checked above.
++	 */
++	WRITE_ONCE(root->tiled_stitch_fallback, true);
++	root->tiled_fallback_jiffies = jiffies;
++	dm->tiled_kmodeset_tries = 0;
+ 	mutex_unlock(&dm->dc_lock);
+ 
+-	if (!fail_root)
+-		drm_warn(dev, "APPLE5K: second tile still down after %u kernel modesets\n",
+-			 tries);
+-	request_bad = true;
++	drm_warn(dev, "APPLE5K: second tile lost for good; driving the root tile alone, desktop squeezed into it\n");
++	ret = dm_force_atomic_commit(&root->base);
++	if (ret) {
++		/* Nothing changed on screen; keep the stitch consistent with it. */
++		mutex_lock(&dm->dc_lock);
++		WRITE_ONCE(root->tiled_stitch_fallback, false);
++		mutex_unlock(&dm->dc_lock);
++		drm_err(dev, "APPLE5K: single-tile fallback commit failed: %d; staying stitched\n",
++			ret);
++	}
+ 
+ unlock:
+ 	drm_modeset_unlock_all(dev);
+@@ -16831,13 +16982,26 @@ out:
+ 
+ static void amdgpu_dm_queue_tiled_resync(struct amdgpu_device *adev, bool modeset)
+ {
++	bool fallback = false;
++	int i;
++
+ 	if (!amdgpu_dm_has_tiled_stitch_panel(adev))
+ 		return;
+ 
++	/* The root lit alone is the fallback's normal state, not a failure. */
++	for (i = 0; i < adev->dm.dc->link_count; i++)
++		if (amdgpu_dm_link_is_tiled_stitch_root(adev->dm.dc->links[i]) &&
++		    amdgpu_dm_link_tiled_stitch_fallback(adev->dm.dc->links[i]))
++			fallback = true;
++
+ 	mutex_lock(&adev->dm.dc_lock);
+ 	if (!adev->dm.tiled_resync_stopping && !adev->dm.dc->apple_5k_going_down &&
+ 	    !adev->in_suspend && !amdgpu_in_reset(adev)) {
+-		if (modeset) {
++		if (modeset && fallback) {
++			adev->dm.tiled_link_checks = 0;
++			drm_info(adev_to_drm(adev),
++				 "APPLE5K: link-health not armed: single-tile fallback\n");
++		} else if (modeset) {
+ 			adev->dm.tiled_link_checks = APPLE5K_LINK_CHECKS;
+ 			adev->dm.tiled_link_recoveries = 0;
+ 			drm_info(adev_to_drm(adev),
+diff --git a/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.h b/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.h
+index 0a7f7c9fd..e25f3bf92 100644
+--- a/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.h
++++ b/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.h
+@@ -952,6 +952,17 @@ struct amdgpu_dm_connector {
+ 	 * still carries the tile block.
+ 	 */
+ 	bool tiled_stitch_latched;
++	/*
++	 * Apple 5K stitch root: the second tile stayed down through the kernel
++	 * modesets, so the root tile alone shows the whole mode, squeezed.
++	 * Read locklessly (READ_ONCE); written, with the fields below, under
++	 * the modeset locks and dc_lock.
++	 */
++	bool tiled_stitch_fallback;
++	u8 tiled_relatch_count;
++	unsigned long tiled_fallback_jiffies;
++#define APPLE5K_RELATCH_MIN_MS 60000
++#define APPLE5K_RELATCH_MAX 2
+ 	struct dc_crtc_timing *timing_requested;
+ 
+ 	/* Adaptive Sync */
+-- 
+2.56.0
+

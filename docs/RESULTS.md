@@ -4,8 +4,8 @@ This document lists what was measured, how it was measured, and what was not mea
 Every number links to a run in [`../evidence/run-journal.md`](../evidence/run-journal.md).
 The journal also lists the failures.
 
-**Which build?** "Default" is patches `0001`–`0033`, the build I use every day. "Candidate" is
-`0001`–`0037`. "Earlier build" is `0001`–`0031`. See the [README](../README.md#two-builds-default-and-candidate).
+**Which build?** "Default" is patches `0001`–`0032`, the build I use every day. "Candidate" is
+`0001`–`0036`. "Earlier build" is `0001`–`0030`. See the [README](../README.md#two-builds-default-and-candidate).
 
 ## Test machine
 
@@ -14,11 +14,13 @@ The journal also lists the failures.
 | Machine | iMac20,2 (27-inch, 2020) |
 | GPU | Radeon Pro 5700 (Navi 10), display engine DCN 2.0 |
 | OS | Omarchy (Arch Linux), Hyprland |
-| Kernel | `linux-t2` 7.2.9 (`7.2.9-arch1-Watanare-T2-1-t2`) |
+| Kernel | `linux-t2` 7.2.11 (`7.2.11-arch1-Watanare-T2-1-t2`) |
 | Compiler | gcc 16.2.1 |
-| Default build module | sha256 `62832c210db33aa0ed33da0efe7c9a36f7a9e7f29445af0d18bf65bf27b28e52` |
-| Candidate build module | sha256 `bcea67d644db942d1e0db9ff0ef3a9237de47b23ccb91d9bfc146c49561e5611` |
-| Earlier build module | sha256 `9a5bf7c7219f37176a511dcbd68a0e629c0bba1f2457ce2bfe40e670421d3384` |
+| Default build module | sha256 `e4f2346a893394e0ecdd68b0b19d5ecdb88bbd60352c31ad25ac97c5271dcb5e` |
+| Candidate build module | sha256 `7fc9af2cd5ff7efd94def5d6ff17ab54d9e328f229e235086dc314c85b09cd92` (built, not booted yet) |
+
+The campaigns on this page ran on an earlier 7.2 point release of `linux-t2`, with the same
+patches. On 7.2.11 the default build has my daily boots behind it, not a new campaign.
 
 ## Method
 
@@ -51,19 +53,19 @@ A boot passes when all of these are true:
 - The two tiles are in phase: the log reports a difference of 0 lines (the limit is 3).
 - The link-health check passes.
 
-## The GPU start-up problem (patches 0004, 0032, 0033)
+## The GPU start-up problem (patches 0003, 0031, 0032)
 
 On this iMac, `amdgpu` fails to start the GPU on about half of all boots. The error is
 `SMU: No response msg_reg: 6` and `-62`.
 
 All data: [`../evidence/reorder-campaign-2026-10-12.tsv`](../evidence/reorder-campaign-2026-10-12.tsv).
-Method: warm reboots, 2026-10-12, `linux-t2` 7.2.9.
+Method: warm reboots, 2026-10-12, `linux-t2` 7.2.
 
 | Arm | Driver | Boots | First probe OK | 95 % interval |
 |---|---|---|---|---|
-| A | Vanilla 7.2.9 | 20 | 11 | 32–77 % |
-| B | Vanilla + the reorder (`0032`) only | 100 | **100** | 96.4–100 % |
-| C | B + my probe deferral (`0004`) | 20 | 20. The deferral never fired | 83–100 % |
+| A | Vanilla | 20 | 11 | 32–77 % |
+| B | Vanilla + the reorder (`0031`) only | 100 | **100** | 96.4–100 % |
+| C | B + my probe deferral (`0003`) | 20 | 20. The deferral never fired | 83–100 % |
 | D | **Default build** (reorder + stitch + KFD fix) | 30 | **30**. No deferral, no mode-1 reset | 88–100 % |
 
 - Every B, C and D boot logged Display Core before "SMU is initialized". Every A boot
@@ -74,15 +76,15 @@ Method: warm reboots, 2026-10-12, `linux-t2` 7.2.9.
   ([comment](https://github.com/t2linux/wiki/issues/743#issuecomment-6163146905)).
 - **KFD warning:** the one-time `kfd_device.c:1139` warning at the first resume came from
   any failed first probe. It is gone in arm C and D (no warning in 3 suspends on each).
-  It is explained and fixed by `0033`.
-- **Probe deferral (`0004`)** was tested on its own before the reorder was known, on mainline
+  It is explained and fixed by `0032`.
+- **Probe deferral (`0003`)** was tested on its own before the reorder was known, on mainline
   `linux` 7.2.3: campaign 8 (an earlier version) 35 of 35 boots OK, 20 of 20 failed
-  probes rescued. Campaign 9 (version 4, the same added lines as `0004`) 30 of 30 OK, 14 of 14
+  probes rescued. Campaign 9 (version 4, the same added lines as `0003`) 30 of 30 OK, 14 of 14
   rescued. It works. The reorder makes it unnecessary here.
 
 ## Boot and display, by build
 
-### Default build (`0001`–`0033`)
+### Default build (`0001`–`0032`)
 
 | Check | Result | Run |
 |---|---|---|
@@ -91,7 +93,7 @@ Method: warm reboots, 2026-10-12, `linux-t2` 7.2.9.
 | Display off/on cycles | 30 cycles. 1 needed a retrain (the short artefact) | arm D |
 | Suspend and resume | 3 of 3. No KFD warning | arm D |
 
-### Earlier build (`0001`–`0031`)
+### Earlier build (`0001`–`0030`)
 
 This build has the same stitch code. Most of the evidence comes from it.
 
@@ -109,19 +111,19 @@ This build has the same stitch code. Most of the evidence comes from it.
 
 One campaign (runs 051 to 057) was stopped after a **crash** in run 057. The link-recovery
 code locked a mutex twice. A hung-task panic rebooted the machine into the known-good
-module after 122 seconds. This was fixed (patch `0031`). It is listed here because the
+module after 122 seconds. This was fixed (patch `0030`). It is listed here because the
 counts above do not show it.
 
-### Candidate build (`0001`–`0037`)
+### Candidate build (`0001`–`0036`)
 
 | Check | Result | Run |
 |---|---|---|
 | 10 boots (rig) | 10 of 10 pass. Phase 0. 0 recoveries. 30 of 30 wakes. 10 of 10 mode round trips | 092 to 101 |
 | 100 display off/on cycles, me at the screen | 100 of 100 pass with 0 recoveries. 46 alignment blips were logged and healed by themselves. I saw none of the short artefact | 091 |
-| Fallback (`0035`), with a **simulated** failure | The desktop appeared whole with the right proportions. It stayed so after a display cycle and an S3 resume | 091 |
-| In-kernel recovery (`0034`), with a **simulated** failure | With the test switch at 5, link health failed once. The kernel's own modeset (the first of the two it may try) brought the second tile back. This ran on a slightly earlier candidate (`0001`–`0036` plus a first version of the wake fix) | 090 |
+| Fallback (`0034`), with a **simulated** failure | The desktop appeared whole with the right proportions. It stayed so after a display cycle and an S3 resume | 091 |
+| In-kernel recovery (`0033`), with a **simulated** failure | With the test switch at 5, link health failed once. The kernel's own modeset (the first of the two it may try) brought the second tile back. This ran on a slightly earlier candidate (`0001`–`0035` plus a first version of the wake fix) | 090 |
 
-What the simulated tests mean: the switch `amdgpu.tiled_fault` (patch `0036`) makes the
+What the simulated tests mean: the switch `amdgpu.tiled_fault` (patch `0035`) makes the
 driver report the second tile as not ready. It does not break the hardware. The real
 failure has never happened on my machine. These tests show that the recovery code runs
 and that Hyprland accepts the result. They do not show that the recovery works for a real
@@ -146,9 +148,9 @@ not change.
 
 ### Code size
 
-Against Arch tag `v7.2.9-arch1`, the 37 patches add about 4,000 lines. About 3,100 of
+Against Arch tag `v7.2.11-arch1`, the 36 patches add about 4,000 lines. About 3,100 of
 the added lines come from the community patches without change. The default build
-(`0001`–`0033`) compiles with gcc 16.2.1 without warnings.
+(`0001`–`0032`) compiles with gcc 16.2.1 without warnings.
 
 ## What was not measured
 
@@ -169,7 +171,6 @@ Please read this list. It is as important as the results.
 - **Rendering performance.** No benchmark was run.
 - **`amdgpu.tiled_genlock=1`.** It was never run on hardware. All results use the default (0).
 - **Other compositors.** Only Hyprland.
-- **Kernel 7.2.10.** The series applies with patch `0003` dropped. I did not build or boot it.
 - **The user-space rescue script.** My machine has a script that rebinds `amdgpu` after
   a failed first probe. I did not record whether it ran in each earlier boot. In arm D
   the first probe never failed, so it was not needed.

@@ -1,0 +1,193 @@
+From e5502db3da3272c13e22be8765f5ea3d5cbaf57b Mon Sep 17 00:00:00 2001
+From: Teemu Haila <teemu.haila@gmail.com>
+Date: Sat, 10 Oct 2026 20:52:39 +0300
+Subject: [PATCH 21/36] drm/amd/display: gate the Apple 5K tile stack on DCN to
+ iMac20,x (A1)
+
+The lean core and stitch layer key on the Apple panel IDs alone. They were
+written and tested on DCE (iMac15,1, 18,3, iMacPro1,1); the only DCN
+machine with this panel is the iMac20,x (Navi 10, DCN 2.0), and the DCN
+adapter that follows has been reviewed for that machine alone.
+
+Add a DMI quirk for iMac20,1 and iMac20,2 (exact product match, terminated
+table) and carry it into DC as dc->config.apple_imac20_tiles. The tile role
+flags in apply_edid_quirks() are now set on DCN only when it is present.
+Every later tile path (pairing, 0x4F1 wake, stitch, genlock) derives from
+those role flags, so this is the single gate. DCE behaviour is unchanged.
+
+[adapter: new, Sysadmin patches/amdgpu-imac20-2-5k-stitch DESIGN.md A1]
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01SUvgXxxT5Apr7YLjKZVd2T
+---
+ .../gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.c |  2 ++
+ .../gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.h |  8 +++++
+ .../amd/display/amdgpu_dm/amdgpu_dm_helpers.c |  7 ++++
+ .../amd/display/amdgpu_dm/amdgpu_dm_quirks.c  | 33 ++++++++++++++++++-
+ drivers/gpu/drm/amd/display/dc/dc.h           | 19 +++++++++++
+ 5 files changed, 68 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.c b/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.c
+index 45e08f010..047ce25a9 100644
+--- a/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.c
++++ b/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.c
+@@ -3066,6 +3066,8 @@ static int amdgpu_dm_init(struct amdgpu_device *adev)
+ 	retrieve_dmi_info(&adev->dm);
+ 	if (adev->dm.edp0_on_dp1_quirk)
+ 		init_data.flags.support_edp0_on_dp1 = true;
++	if (adev->dm.apple_imac20_tiles_quirk)
++		init_data.flags.apple_imac20_tiles = true;
+ 
+ 	if (adev->dm.bb_from_dmub)
+ 		init_data.bb_from_dmub = adev->dm.bb_from_dmub;
+diff --git a/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.h b/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.h
+index 84211f04b..b56539f0b 100644
+--- a/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.h
++++ b/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.h
+@@ -725,6 +725,14 @@ struct amdgpu_display_manager {
+ 	 */
+ 	bool edp0_on_dp1_quirk;
+ 
++	/**
++	 * @apple_imac20_tiles_quirk:
++	 *
++	 * DMI-matched iMac20,x: lets the Apple 5K tile pairing, stitch and
++	 * genlock code engage on this DCN 2.0 GPU.
++	 */
++	bool apple_imac20_tiles_quirk;
++
+ 	/**
+ 	 * @dpia_aux_lock:
+ 	 *
+diff --git a/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm_helpers.c b/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm_helpers.c
+index 81f3b33ea..8cad3ace6 100644
+--- a/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm_helpers.c
++++ b/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm_helpers.c
+@@ -198,6 +198,13 @@ static void apply_edid_quirks(struct dc_link *link, struct edid *edid,
+ 	case drm_edid_encode_panel_id('A', 'P', 'P', 0xAE26):
+ 	case drm_edid_encode_panel_id('A', 'P', 'P', 0xAE31):
+ 	case drm_edid_encode_panel_id('A', 'P', 'P', 0xAE32):
++		/*
++		 * Without the role flags nothing downstream engages: no wiring,
++		 * no 0x4F1 wake, no stitch. This is the single gate that keeps
++		 * the DCE-developed stack off unreviewed DCN machines.
++		 */
++		if (!dc_apple_tiles_allowed(link->dc))
++			break;
+ 		if (link->connector_signal == SIGNAL_TYPE_EDP)
+ 			edid_caps->panel_patch.apple_tiled_root = 1;
+ 		else if (link->connector_signal == SIGNAL_TYPE_DISPLAY_PORT)
+diff --git a/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm_quirks.c b/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm_quirks.c
+index 1da07ebf9..319eef656 100644
+--- a/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm_quirks.c
++++ b/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm_quirks.c
+@@ -32,11 +32,13 @@
+ struct amdgpu_dm_quirks {
+ 	bool aux_hpd_discon;
+ 	bool support_edp0_on_dp1;
++	bool apple_imac20_tiles;
+ };
+ 
+ static struct amdgpu_dm_quirks quirk_entries = {
+ 	.aux_hpd_discon = false,
+-	.support_edp0_on_dp1 = false
++	.support_edp0_on_dp1 = false,
++	.apple_imac20_tiles = false
+ };
+ 
+ static int edp0_on_dp1_callback(const struct dmi_system_id *id)
+@@ -45,6 +47,12 @@ static int edp0_on_dp1_callback(const struct dmi_system_id *id)
+ 	return 0;
+ }
+ 
++static int apple_imac20_tiles_callback(const struct dmi_system_id *id)
++{
++	quirk_entries.apple_imac20_tiles = true;
++	return 0;
++}
++
+ static int aux_hpd_discon_callback(const struct dmi_system_id *id)
+ {
+ 	quirk_entries.aux_hpd_discon = true;
+@@ -150,6 +158,24 @@ static const struct dmi_system_id dmi_quirk_table[] = {
+ 			DMI_MATCH(DMI_PRODUCT_NAME, "HP ProBook 465 16 inch G11 Notebook PC"),
+ 		},
+ 	},
++	/*
++	 * iMac20,x (Navi 10, DCN 2.0) with the 27" 5K panel. Exact product
++	 * match so "iMac20,1" cannot also catch a later "iMac20,1x".
++	 */
++	{
++		.callback = apple_imac20_tiles_callback,
++		.matches = {
++			DMI_MATCH(DMI_SYS_VENDOR, "Apple Inc."),
++			DMI_EXACT_MATCH(DMI_PRODUCT_NAME, "iMac20,1"),
++		},
++	},
++	{
++		.callback = apple_imac20_tiles_callback,
++		.matches = {
++			DMI_MATCH(DMI_SYS_VENDOR, "Apple Inc."),
++			DMI_EXACT_MATCH(DMI_PRODUCT_NAME, "iMac20,2"),
++		},
++	},
+ 	{}
+ 	/* TODO: refactor this from a fixed table to a dynamic option */
+ };
+@@ -161,6 +187,7 @@ void retrieve_dmi_info(struct amdgpu_display_manager *dm)
+ 
+ 	dm->aux_hpd_discon_quirk = false;
+ 	dm->edp0_on_dp1_quirk = false;
++	dm->apple_imac20_tiles_quirk = false;
+ 
+ 	dmi_id = dmi_check_system(dmi_quirk_table);
+ 
+@@ -175,4 +202,8 @@ void retrieve_dmi_info(struct amdgpu_display_manager *dm)
+ 		dm->edp0_on_dp1_quirk = true;
+ 		drm_info(dev, "support_edp0_on_dp1 attached\n");
+ 	}
++	if (quirk_entries.apple_imac20_tiles) {
++		dm->apple_imac20_tiles_quirk = true;
++		drm_info(dev, "apple_imac20_tiles quirk attached\n");
++	}
+ }
+diff --git a/drivers/gpu/drm/amd/display/dc/dc.h b/drivers/gpu/drm/amd/display/dc/dc.h
+index c45fe78d0..daefc1129 100644
+--- a/drivers/gpu/drm/amd/display/dc/dc.h
++++ b/drivers/gpu/drm/amd/display/dc/dc.h
+@@ -607,6 +607,12 @@ struct dc_config {
+ 	bool allow_0_dtb_clk;
+ 	bool use_assr_psp_message;
+ 	bool support_edp0_on_dp1;
++	/*
++	 * DMI-matched iMac20,x: the one DCN machine with the Apple 5K tiled
++	 * panel. The tile stack below was written on DCE; on DCN it engages
++	 * only when this is set (dc_apple_tiles_allowed()).
++	 */
++	bool apple_imac20_tiles;
+ 	unsigned int enable_fpo_flicker_detection;
+ 	bool disable_hbr_audio_dp2;
+ 	bool consolidated_dpia_dp_lt;
+@@ -2887,6 +2893,19 @@ struct dc_sink {
+ void dc_sink_retain(struct dc_sink *sink);
+ void dc_sink_release(struct dc_sink *sink);
+ 
++/*
++ * May the Apple 5K tile quirks engage on this DC? Always on DCE, where the
++ * stack was developed (iMac15,1 to iMac19,1, iMacPro1,1). On DCN only for
++ * the DMI-matched iMac20,x: nothing else with a DCN GPU has this panel, and
++ * the DCN port has been reviewed for that machine alone.
++ */
++static inline bool dc_apple_tiles_allowed(const struct dc *dc)
++{
++	return dc && dc->ctx &&
++	       (dc->ctx->dce_version < DCN_VERSION_1_0 ||
++		dc->config.apple_imac20_tiles);
++}
++
+ static inline const struct dc_panel_patch *
+ dc_link_panel_patch(const struct dc_link *link)
+ {
+-- 
+2.56.0
+

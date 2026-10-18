@@ -16,7 +16,7 @@ The full text of GPL-2.0-only is in `LICENSES/GPL-2.0-only.txt`. The text of the
 licence and the copyright lines are in the kernel source tree and in the repositories that
 we name in [ACKNOWLEDGEMENTS.md](ACKNOWLEDGEMENTS.md).
 
-The new patches (0004, 0022 to 0031) are offered under the same licence as the files that
+The new patches (0003, 0021 to 0030) are offered under the same licence as the files that
 they change.
 
 ## Documentation (everything else)

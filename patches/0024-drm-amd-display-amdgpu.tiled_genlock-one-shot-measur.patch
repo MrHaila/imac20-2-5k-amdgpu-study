@@ -1,0 +1,103 @@
+From 516be60307450e16b3eafe7f0ccda6a22dddd1d7 Mon Sep 17 00:00:00 2001
+From: Teemu Haila <teemu.haila@gmail.com>
+Date: Sat, 10 Oct 2026 20:55:46 +0300
+Subject: [PATCH 24/36] drm/amd/display: amdgpu.tiled_genlock, one-shot +
+ measured re-align on iMac20 (A4)
+
+amdgpu_dm_per_frame_crtc_reset_supported() decides between two genlock
+strategies for the Apple tile pair: the per-frame OTG reset (DCE 12+), or
+the one-shot alignment in each modeset plus retina's measured re-align
+after commits (DCE < 12). It answered "per-frame" for every DCN part.
+
+On DCN 2.0 that path arms the slave OTG against OTG 0 whatever the master
+is (fixed for the tile pair in the next commit), and nobody tears the
+trigger down again. DCN's per-frame reset has never been enabled by
+default upstream. Both tiles very likely share one DP reference clock, so
+once aligned they should stay aligned.
+
+So on a DMI-matched iMac20 make the choice a parameter, defaulting to the
+one-shot + measured re-align. amdgpu_dm_tiled_measured_realign() uses only
+get_position() and hwss.enable_timing_synchronization(), which DCN 2.0
+implements (optc1_get_position(), dcn10_enable_timing_synchronization()).
+amdgpu.tiled_genlock=1 selects the per-frame reset for the D1 comparison.
+
+[adapter: new, Sysadmin patches/amdgpu-imac20-2-5k-stitch DESIGN.md A4]
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01SUvgXxxT5Apr7YLjKZVd2T
+---
+ drivers/gpu/drm/amd/amdgpu/amdgpu.h               |  1 +
+ drivers/gpu/drm/amd/amdgpu/amdgpu_drv.c           | 13 +++++++++++++
+ drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.c | 13 ++++++++++++-
+ 3 files changed, 26 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu.h b/drivers/gpu/drm/amd/amdgpu/amdgpu.h
+index 901347c08..bf0f98126 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu.h
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu.h
+@@ -261,6 +261,7 @@ extern int amdgpu_sg_display;
+ extern int amdgpu_umsch_mm;
+ extern int amdgpu_seamless;
+ extern int amdgpu_tiled_stitch;
++extern int amdgpu_tiled_genlock;
+ extern int amdgpu_umsch_mm_fwlog;
+ 
+ extern int amdgpu_user_partt_mode;
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_drv.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_drv.c
+index 0d4d2bdf4..503f4a6de 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_drv.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_drv.c
+@@ -241,6 +241,7 @@ int amdgpu_user_partt_mode = AMDGPU_AUTO_COMPUTE_PARTITION_MODE;
+ int amdgpu_umsch_mm;
+ int amdgpu_seamless = -1; /* auto */
+ int amdgpu_tiled_stitch = -1; /* auto */
++int amdgpu_tiled_genlock; /* 0: one-shot + measured re-align */
+ uint amdgpu_debug_mask;
+ int amdgpu_agp = -1; /* auto */
+ int amdgpu_wbrf = -1;
+@@ -1053,6 +1054,18 @@ MODULE_PARM_DESC(tiled_stitch,
+ 	"Stitch supported Apple iMac 5K dual-tile panels into one logical display (-1 = auto/default, 0 = disable, 1 = enable supported iMac panels only)");
+ module_param_named(tiled_stitch, amdgpu_tiled_stitch, int, 0444);
+ 
++/**
++ * DOC: tiled_genlock (int)
++ * How the two tiles of the Apple 5K panel are kept in lockstep on the
++ * iMac20,x (DCN 2.0). 0 (default): align once in each modeset, then measure
++ * the tile phase after commits and re-align only if it drifted. 1: arm the
++ * per-frame OTG reset, slave tile locked to the master tile's vsync.
++ * Ignored on other machines.
++ */
++MODULE_PARM_DESC(tiled_genlock,
++	"iMac20,x 5K tile genlock (0 = one-shot + measured re-align (default), 1 = per-frame OTG reset)");
++module_param_named(tiled_genlock, amdgpu_tiled_genlock, int, 0444);
++
+ /**
+  * DOC: debug_mask (uint)
+  * Debug options for amdgpu, work as a binary mask with the following options:
+diff --git a/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.c b/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.c
+index 047ce25a9..28d4fd1f1 100644
+--- a/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.c
++++ b/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.c
+@@ -8373,7 +8373,18 @@ static void set_master_stream(struct dc_stream_state *stream_set[],
+  */
+ static bool amdgpu_dm_per_frame_crtc_reset_supported(const struct dc *dc)
+ {
+-	return dc && dc->ctx && dc->ctx->dce_version >= DCE_VERSION_12_0;
++	if (!dc || !dc->ctx)
++		return false;
++	/*
++	 * iMac20,x (DCN 2.0): the per-frame reset works on DCN, but it has never
++	 * been enabled by default upstream and both tiles run off one DP
++	 * reference clock, so once aligned they should stay aligned. Default to
++	 * the one-shot plus measured re-align, which only uses paths DCN already
++	 * runs for multi-display sync; tiled_genlock=1 opts into per-frame.
++	 */
++	if (dc->config.apple_imac20_tiles)
++		return amdgpu_tiled_genlock == 1;
++	return dc->ctx->dce_version >= DCE_VERSION_12_0;
+ }
+ 
+ static bool amdgpu_dm_force_timing_sync_enabled(struct amdgpu_display_manager *dm)
+-- 
+2.56.0
+

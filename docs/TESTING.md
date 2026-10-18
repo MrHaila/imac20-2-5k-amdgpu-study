@@ -9,8 +9,8 @@ You can build two versions. They differ by four patches.
 
 | Build | Patches | Choose it if |
 |---|---|---|
-| **Default** | `0001`–`0033` | You want the build that I use every day. **Start here.** |
-| **Candidate** | `0001`–`0037` | You want to help me check four fixes that I have not used for daily work yet. It also adds a switch to simulate failures. |
+| **Default** | `0001`–`0032` | You want the build that I use every day. **Start here.** |
+| **Candidate** | `0001`–`0036` | You want to help me check four fixes that I have not used for daily work yet. It also adds a switch to simulate failures. |
 
 Details: [README](../README.md#two-builds-default-and-candidate). The difference in
 behaviour is small in normal use. The default can show a short artefact on about 1 display
@@ -28,9 +28,8 @@ You need all of these:
 
 - An **iMac20,2**. An iMac20,1 matches the same gate, but nobody has tested it.
   Check with `cat /sys/class/dmi/id/product_name`.
-- The kernel **`linux-t2` 7.2.9** (`uname -r` shows `7.2.9-arch1-Watanare-T2-1-t2`), with
-  the matching `linux-t2-headers` package. The patches are made for this version. They
-  also apply to 7.2.10 if you leave out patch `0003`, but I have not built or booted that.
+- The kernel **`linux-t2` 7.2.11** (`uname -r` shows `7.2.11-arch1-Watanare-T2-1-t2`), with
+  the matching `linux-t2-headers` package. The patches are made for this version.
   A module must match your running kernel exactly (Step 3).
 - A way to reach the machine **without the display**. Use SSH from a second computer. Test
   the SSH login before you start.
@@ -57,15 +56,15 @@ If `updates/amdgpu.ko.zst` exists, copy it to a safe place now.
 ## Step 2: Get the source and apply the patches
 
 ```bash
-git clone --depth 1 --filter=blob:none --sparse --branch v7.2.9-arch1 \
-    https://github.com/archlinux/linux.git linux-7.2.9
-cd linux-7.2.9
+git clone --depth 1 --filter=blob:none --sparse --branch v7.2.11-arch1 \
+    https://github.com/archlinux/linux.git linux-7.2.11
+cd linux-7.2.11
 git sparse-checkout set --no-cone '/drivers/gpu/drm/amd/' '/scripts/' '/MAINTAINERS'
 
-# Default build: the first 33 patches
-git am $(ls /path/to/this/repo/patches/*.patch | head -33)
+# Default build: the first 32 patches
+git am $(ls /path/to/this/repo/patches/*.patch | head -32)
 
-# Candidate build instead: all 37 patches
+# Candidate build instead: all 36 patches
 # git am /path/to/this/repo/patches/*.patch
 ```
 
@@ -240,7 +239,7 @@ found, before the stitch layer runs.
 
 ### Candidate only: `amdgpu.tiled_fault`
 
-Patch `0036` adds `amdgpu.tiled_fault`. It makes the driver **pretend** that the second tile
+Patch `0035` adds `amdgpu.tiled_fault`. It makes the driver **pretend** that the second tile
 is not ready, so that the recovery code runs. It does not damage anything. You can change it
 while the system runs.
 

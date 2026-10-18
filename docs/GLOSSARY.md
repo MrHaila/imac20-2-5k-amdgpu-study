@@ -5,15 +5,15 @@ The words that this repository uses. If a word is missing, please open an issue.
 ## The two builds
 
 **Default build**
-: Patches `0001`–`0033`. The build I use every day on my iMac. "Default" means "my machine
+: Patches `0001`–`0032`. The build I use every day on my iMac. "Default" means "my machine
   boots it by default". It does not mean "official release".
 
 **Candidate build**
-: Patches `0001`–`0037`. The default build plus four patches that fix known problems. It
+: Patches `0001`–`0036`. The default build plus four patches that fix known problems. It
   passed my automated tests. I have not used it for daily work yet.
 
 **Earlier build** or **earlier default**
-: Patches `0001`–`0031`. My daily driver for part of 2026-10-12. Most of the run journal
+: Patches `0001`–`0030`. My daily driver for part of 2026-10-12. Most of the run journal
   comes from this build or older ones.
 
 ## The panel
@@ -54,10 +54,10 @@ The words that this repository uses. If a word is missing, please open an issue.
 
 **SMU**
 : The GPU's power controller. On this iMac it sometimes does not answer at start-up (error
-  `-62`, `EnableAllSmuFeatures`). Patch `0032` fixes that.
+  `-62`, `EnableAllSmuFeatures`). Patch `0031` fixes that.
 
 **PSP**
-: The GPU's security processor. It loads firmware. My patch `0004` was written because of how
+: The GPU's security processor. It loads firmware. My patch `0003` was written because of how
   the PSP behaves after Apple's firmware.
 
 **Probe**
@@ -65,7 +65,7 @@ The words that this repository uses. If a word is missing, please open an issue.
   in a boot. "Deferred probe" means the kernel tries again later.
 
 **KFD**
-: The compute part of the AMD driver (ROCm). Patch `0033` fixes a counter bug in its error path.
+: The compute part of the AMD driver (ROCm). Patch `0032` fixes a counter bug in its error path.
 
 **DPMS**
 : Display power management. "A DPMS cycle" is: display off, then on. Omarchy does this when the screen
@@ -106,10 +106,10 @@ The words that this repository uses. If a word is missing, please open an issue.
 
 **Arm A, B, C, D**
 : The groups of the GPU start-up test. A = vanilla driver. B = vanilla plus the reorder
-  (`0032`). C = B plus my probe deferral (`0004`). D = the stitched default build.
+  (`0031`). C = B plus my probe deferral (`0003`). D = the stitched default build.
 
 **B2, L5, L6, L7**
 : Labels from the independent review of my first design
   ([`background/independent-review.md`](background/independent-review.md)). B2 = the
-  unlocked cursor (`0028`). L5 = recovery depends on the compositor (`0034`). L6 = no
-  fallback if the second tile is lost (`0035`). L7 = wake-up ordering (`0029`).
+  unlocked cursor (`0027`). L5 = recovery depends on the compositor (`0033`). L6 = no
+  fallback if the second tile is lost (`0034`). L7 = wake-up ordering (`0028`).

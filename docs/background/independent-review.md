@@ -3,7 +3,7 @@
 Adversarial review of the untested 23-patch series on branch `5k-stitch-poc`. I read
 DESIGN.md, README.md and the whole diff `b8d020e..HEAD`, with most attention on the
 hunks that DCN 2.0 reaches through code paths that DCE never used. I cross-checked the
-stock 7.2.9 DC code that the series calls into: `program_timing_sync`,
+stock 7.2 DC code that the series calls into: `program_timing_sync`,
 `dcn10_enable_timing_synchronization`, `optc1_*_reset_trigger`,
 `create_stream_for_sink`, the DCN cursor path, the IP-block order and PSR gating. I also
 used the archived 7003 boot log and the live eDP EDID (read-only from sysfs). Nothing
@@ -76,7 +76,7 @@ for both connectors.
 ### B2. The peer cursor is programmed on a DCN-only path, without `dc_lock`, mid-commit. The DCE testing never exercised it
 *commit 02 `8404f2a86`; `amdgpu_dm.c:amdgpu_dm_update_cursor()` → `amdgpu_dm_tiled_program_peer_cursor()`*
 
-In 7.2.9, `amdgpu_dm_commit_planes()` calls `amdgpu_dm_update_cursor()` whenever
+In 7.2, `amdgpu_dm_commit_planes()` calls `amdgpu_dm_update_cursor()` whenever
 `amdgpu_ip_version(DCE_HWIP) != 0`. That is true for every DCN part, Navi 10 included.
 The stock function only *stages* the root cursor (`dc_stream_set_cursor_*` +
 `update->cursor_*`), and DC programs it later under `dc_lock`. The stitch hook instead
@@ -402,7 +402,7 @@ must-capture list.
 
 ## Addendum 2026-10-11: "Do this first" done (run 017), favourable branch
 
-Dev boot of the stock `linux-t2` 7.2.9 amdgpu (carries 7003; sha256 `a924f84f…`) through
+Dev boot of the stock `linux-t2` 7.2 amdgpu (carries 7003; sha256 `a924f84f…`) through
 the rig, first probe OK (no rebind). Evidence: `runs/017/collect2/` (EDIDs, `edid-decode`,
 DPCD dump, `modetest`).
 
@@ -428,16 +428,16 @@ mostly answered by run 017 (two correct outputs, rig sees both halves); D0b is n
 
 ## Addendum 2026-10-12: L5 and L6 fixed (candidate build, runs 090–101)
 
-- **L5:** confirmed on hardware that Hyprland ignores `link-status` BAD. `0034` replaces the
+- **L5:** confirmed on hardware that Hyprland ignores `link-status` BAD. `0033` replaces the
   escalation with an in-kernel `dm_force_atomic_commit()` on the root from a worker (at most 2,
   2 s apart, inside the existing 3/min and 12/boot budget, skipped while the CRTC is off or
   during suspend/reset). With `tiled_fault=5`: FAIL → kernel modeset 1/2 → PASS.
 - **L6:** the review's suggestion (unlatch, offer smaller modes, hotplug) was built first and
   failed on hardware: Hyprland kept the 5120 mode, and the next DPMS-on was rejected, which
-  left the panel black. `0035` instead leaves everything userspace sees unchanged and drives the
+  left the panel black. `0034` instead leaves everything userspace sees unchanged and drives the
   root tile alone, with the whole mode squeezed 2:1 into it. The TCON, with the `0x4F1` latch
   still set, stretches the lone root tile back over the panel. The owner saw the complete
   desktop with correct proportions, through a DPMS cycle and an S3 resume. Re-latch never
   triggers (no slave HPD while link 1 is undriven), so the fallback lasts until reboot.
-- **Wake glitch (L7 residue):** not a link failure. See `0037` and runs/README 090–091.
+- **Wake glitch (L7 residue):** not a link failure. See `0036` and runs/README 090–091.
 

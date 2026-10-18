@@ -7,7 +7,7 @@ or booted.** The only tree changes were throwaway copies under `~/src/5k-ref/scr
 Short answer to the R0 gate question ("is there a sensible home on DCN for one CRTC
 driving two streams?"): **yes.** The stitch layer turns out to have almost nothing to do
 with DCE. It lives entirely in `amdgpu_dm` and the display-independent DC core. The whole
-reference stack applies cleanly to our 7.2.9 + probe-defer tree. The DCN-specific work is
+reference stack applies cleanly to our 7.2 + probe-defer tree. The DCN-specific work is
 small (about 150 new lines) and is concentrated in one place: the tile **genlock** (making
 both halves scan out in lockstep).
 
@@ -130,7 +130,7 @@ two-stream configuration.
 ## 3. Does it apply? (dry-run results on our tree)
 
 Method: `git archive HEAD drivers/gpu/drm/amd include/drm` from
-`patches/amdgpu-imac20-2-vpost/build/linux-7.2.9` (v7.2.9-arch1 + probe-defer `b8d020e`)
+the probe-defer tree (the Arch 7.2 tag + probe-defer `b8d020e`)
 into `~/src/5k-ref/scratch-r0/base`. Each stack was applied with `patch -p1 --forward` to
 its own copy (`v-t2`, `v-lean`, `v-t2lean`, `v-retina`). The original tree and its git
 state were not touched.
@@ -293,7 +293,7 @@ measuring (U9).
   has none). Belt and braces for dev boots: `amdgpu.dcdebugmask=0x10` (DC_DISABLE_PSR),
   or skip PSR setup on a stitched root (5 lines).
   **Correction (PoC, 2026-10-10): PSR and Replay cannot engage on Navi10 at all.** In
-  7.2.9, `amdgpu_dm_psr.c:amdgpu_dm_set_psr_caps()` returns early unless
+  7.2, `amdgpu_dm_psr.c:amdgpu_dm_set_psr_caps()` returns early unless
   `dc->caps.dmub_caps.psr` is set, and only the DCN 3.0+ hardware sequencers set it
   (from DMUB firmware caps). `amdgpu_dm_set_replay_caps()` needs `dc->ctx->dmub_srv`.
   DCN 2.0 has no DMUB. So no gate is needed, and A7 is zero lines.
@@ -438,7 +438,7 @@ is clean.
 ```sh
 # scratch copy of the module sources (original tree untouched)
 mkdir -p ~/src/5k-ref/scratch-r0/base
-git -C ~/Sysadmin/patches/amdgpu-imac20-2-vpost/build/linux-7.2.9 archive HEAD \
+git -C <probe-defer tree> archive HEAD \
     drivers/gpu/drm/amd include/drm | tar -x -C ~/src/5k-ref/scratch-r0/base
 # then, per stack: cp -a base v-NAME; patch -p1 -d v-NAME --forward < each.patch
 ```

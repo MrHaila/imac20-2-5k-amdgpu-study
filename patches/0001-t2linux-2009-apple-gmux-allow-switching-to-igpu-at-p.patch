@@ -1,8 +1,8 @@
-From 46ceb86e5e0ab75a936b96848c205de93787f4a0 Mon Sep 17 00:00:00 2001
+From 64b665c687cd381b5f4089336cd006dfdb86ecaa Mon Sep 17 00:00:00 2001
 From: t2linux <t2linux@users.noreply.github.com>
 Date: Sun, 11 Oct 2026 23:30:43 +0300
-Subject: [PATCH 01/31] t2linux
- 2009-apple-gmux-allow-switching-to-igpu-at-probe (linux-t2-patches 65fdd4d;
+Subject: [PATCH 01/36] t2linux
+ 2009-apple-gmux-allow-switching-to-igpu-at-probe (linux-t2-patches e167207;
  amdgpu part only)
 
 ---
@@ -10,7 +10,7 @@ Subject: [PATCH 01/31] t2linux
  1 file changed, 3 insertions(+)
 
 diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_drv.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_drv.c
-index e814701bc..eb0607409 100644
+index 14b539d50..52a7e04a9 100644
 --- a/drivers/gpu/drm/amd/amdgpu/amdgpu_drv.c
 +++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_drv.c
 @@ -2383,6 +2383,9 @@ static int amdgpu_pci_probe(struct pci_dev *pdev,
@@ -24,5 +24,5 @@ index e814701bc..eb0607409 100644
  	    (pdev->class >> 8) == PCI_CLASS_DISPLAY_OTHER) {
  		if (drm_firmware_drivers_only() && amdgpu_modeset == -1)
 -- 
-2.55.0
+2.56.0
 

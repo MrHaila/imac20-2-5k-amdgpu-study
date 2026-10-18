@@ -9,7 +9,7 @@ proposal. Everything here is open to correction.
 
 ## Where the one-CRTC patch is
 
-It is patches `0005`–`0031` of this series (see [PATCH-MAP.md](PATCH-MAP.md), groups C, D and E).
+It is patches `0004`–`0030` of this series (see [PATCH-MAP.md](PATCH-MAP.md), groups C, D and E).
 That is the code of Mark Pronkin and br1uhnz, which I adapted to the DCN display engine of
 the iMac20,2.
 
@@ -25,8 +25,7 @@ are different:
 | Maintenance | Low | High. It touches the hottest parts of `amdgpu_dm.c`. See [KNOWN-ISSUES.md](KNOWN-ISSUES.md), item 6 |
 
 To try it on top of `linux-t2`, you cannot just add it after `7003`. Build from Arch
-`v7.2.9-arch1` and apply `patches/` instead. [TESTING.md](TESTING.md) has the commands. For
-`7.2.10`: the series applies with patch `0003` dropped. I have not built or booted that.
+`v7.2.11-arch1` and apply `patches/` instead. [TESTING.md](TESTING.md) has the commands.
 
 ## Which findings in the thread I can confirm on the iMac20,2
 
@@ -34,14 +33,14 @@ These are from my machine (Radeon Pro 5700, Navi 10). The per-boot data is in
 [`../evidence/reorder-campaign-2026-10-12.tsv`](../evidence/reorder-campaign-2026-10-12.tsv).
 
 1. **The display-before-SMU reorder cures the start-up failure.** This is the
-   `amdgpu_discovery.c` hunk of `7003`, here as patch `0032`, with the `{ }` terminator
+   `amdgpu_discovery.c` hunk of `7003`, here as patch `0031`, with the `{ }` terminator
    added.
 
    | Driver | Boots | First probe OK |
    |---|---|---|
-   | Vanilla 7.2.9 | 20 | 11 |
+   | Vanilla | 20 | 11 |
    | Vanilla + reorder only | 100 | **100** |
-   | Reorder + my probe deferral (`0004`) | 20 | 20. The deferral never fired |
+   | Reorder + my probe deferral (`0003`) | 20 | 20. The deferral never fired |
 
    `edschofield` found the same on the iMac20,1 (Navi 14): 13 of 20 failures with the
    upstream order, none in 40 boots with the reorder. See
@@ -56,7 +55,7 @@ These are from my machine (Radeon Pro 5700, Navi 10). The per-boot data is in
 
    In this series the register is written again in `enable_link_dp()`, right after the eDP
    power-up and the HPD-ready wait, before any link trains. That is **br1uhnz's code**
-   (patch `0020`, from `retina-5k-imac-linux` fix 16), not mine. Patch `0029` (mine) also
+   (patch `0019`, from `retina-5k-imac-linux` fix 16), not mine. Patch `0028` (mine) also
    adds the main stream before the second one, because with the second one first, every
    display wake logged `sink AUX not ready`.
 
@@ -73,23 +72,23 @@ These are from my machine (Radeon Pro 5700, Navi 10). The per-boot data is in
    about 6 % of wakes all four retries show it, and then the left tile appears stretched
    for up to a second. In my tests the sink was aligned again about 400 ms after video
    started, with no retrain. `edschofield` measured 12 of 86 training sequences with
-   this pattern. Patch `0037` skips the retrain for the second tile and leaves the
+   this pattern. Patch `0036` skips the retrain for the second tile and leaves the
    check to the link-health pass. That gave 130 of 130 clean wakes. **I do not know why the
    panel does this.**
 
-4. **A KFD counter bug in vanilla 7.2.9.** After any failed first probe,
+4. **A KFD counter bug in vanilla 7.2 (still in 7.2.11).** After any failed first probe,
    `kgd2kfd_device_exit()` leaves `kfd_locked` at −1 for the lifetime of the module. The next
    suspend then does not evict KFD processes, and the first resume prints
-   `KFD suspend / resume ref. error`. Patch `0033` fixes it (8 lines). With the reorder, the
+   `KFD suspend / resume ref. error`. Patch `0032` fixes it (8 lines). With the reorder, the
    first probe does not fail, so the bug does not show. It is still a bug in the error path.
 
 ## What you could take without the stitch
 
 | Patch | Why it stands alone |
 |---|---|
-| `0032` | It is already the `7003` hunk. Only the `{ }` terminator is added, as in your revised `7003` (`fffa0cb6`) |
-| `0033` | A generic KFD fix, not specific to Apple |
-| The idea of `0037` | Do not retrain the second tile on the post-training `0x204` blip. It would need adapting to `7003`'s DP-1 connector. In a `drm.debug=0x100` log, look for "Link loss" lines on wake |
+| `0031` | It is already the `7003` hunk. Only the `{ }` terminator is added, as in your revised `7003` (`fffa0cb6`) |
+| `0032` | A generic KFD fix, not specific to Apple |
+| The idea of `0036` | Do not retrain the second tile on the post-training `0x204` blip. It would need adapting to `7003`'s DP-1 connector. In a `drm.debug=0x100` log, look for "Link loss" lines on wake |
 
 ## What I am not asking
 

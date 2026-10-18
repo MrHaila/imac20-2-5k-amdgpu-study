@@ -3,15 +3,15 @@
 This list is as complete as I can make it. Items 1 to 3 were seen on hardware. The
 others are known limits of the design or of the evidence.
 
-Each item says whether the **default** build (patches `0001`–`0033`) or the **candidate**
-build (`0001`–`0037`) has it. See the [README](../README.md#two-builds-default-and-candidate)
+Each item says whether the **default** build (patches `0001`–`0032`) or the **candidate**
+build (`0001`–`0036`) has it. See the [README](../README.md#two-builds-default-and-candidate)
 for what these words mean.
 
 ## Seen on hardware
 
 ### 1. A short artefact on about 1 display wake in 25
 
-**Default: yes. Candidate: not seen in 130 wakes (patch `0037`).**
+**Default: yes. Candidate: not seen in 130 wakes (patch `0036`).**
 
 After a display wake (DPMS on), the left half of the panel is sometimes stretched over the
 whole panel for less than one second. Then the picture is correct. Counts on the default
@@ -27,20 +27,20 @@ What I know:
   retrain (27 of 27 cases).
 - Another tester saw the same pattern on an iMac20,1 with patch `7003`: 12 of 86 training
   sequences ([comment](https://github.com/t2linux/wiki/issues/743#issuecomment-6136239556)).
-- `0037` skips the retrain for the second tile and leaves the check to the link-health pass.
+- `0036` skips the retrain for the second tile and leaves the check to the link-health pass.
 
 What I do not know: **why the panel drops the alignment** while the idle pattern runs. I
-have not ruled out my code, and I have not ruled out the panel. `0037` hides the symptom. A
+have not ruled out my code, and I have not ruled out the panel. `0036` hides the symptom. A
 real link loss is still caught by the link-health check, but I have never seen one.
 
 ### 2. A kernel warning at the first resume
 
-**Default: fixed (`0033`). Candidate: fixed.**
+**Default: fixed (`0032`). Candidate: fixed.**
 
 It was a warning from `kfd_device.c:1139` at the first resume of a boot. It was not caused
-by the stitch. Any failed first probe left KFD's global counter at −1. The reorder (`0032`)
-removes the failed probe, and `0033` fixes the counter in the error path. I saw no warning
-in the arm D boots. The cause is in vanilla 7.2.9. See
+by the stitch. Any failed first probe left KFD's global counter at −1. The reorder (`0031`)
+removes the failed probe, and `0032` fixes the counter in the error path. I saw no warning
+in the arm D boots. The cause is in vanilla 7.2. See
 [FOR-T2LINUX.md](FOR-T2LINUX.md), item 4.
 
 ### 3. The panel shows an after-image on fast motion
@@ -66,15 +66,15 @@ I have never seen the second tile fail for good on real hardware. The review sai
   property. KWin and Mutter handle it. I do not know of such handling in Hyprland
   (aquamarine or wlroots). So the right half of the desktop would stay dark until a
   display cycle or a reboot.
-- **Candidate:** the kernel does the full mode set itself, up to two times (`0034`). If that
+- **Candidate:** the kernel does the full mode set itself, up to two times (`0033`). If that
   fails, it drives only the left tile and squeezes the whole desktop into it. The panel
-  stretches it back (`0035`). The picture then has half the horizontal resolution. The
+  stretches it back (`0034`). The picture then has half the horizontal resolution. The
   fallback stays until reboot. I tried to make it leave the fallback when the second tile
   comes back, but that needs a hotplug event from link 1, and link 1 is not driven in the
   fallback. In practice you reboot.
 - The first design of the fallback changed the mode list. Hyprland ignored that, and the
   panel went black (run 090). The shipped design leaves the mode list alone.
-- The switch `amdgpu.tiled_fault` (`0036`) simulates failures. It tests the code. It does not
+- The switch `amdgpu.tiled_fault` (`0035`) simulates failures. It tests the code. It does not
   prove that the recovery works for a real failure.
 
 ### 5. No native 4K mode while the stitch is active
@@ -89,8 +89,7 @@ and set again on every mode change.
 
 **Both.**
 
-The patches apply to Arch `v7.2.9-arch1`. They also apply to `v7.2.10-arch1` with patch
-`0003` dropped, but I have not built or booted that. The review predicts that a move of the
+The patches apply to Arch `v7.2.11-arch1`. The review predicts that a move of the
 connector code in 7.3 will break about a third of the changes in `amdgpu_dm.c`, and that
 each later kernel needs a half day to a day of porting, plus new tests. This is the main
 reason why the work is a study and not a product.
@@ -141,7 +140,7 @@ an iMac20,1.
 - The second tile is driven in a plain DisplayPort mode when its panel ID is `AE31` or
   `AE32`. The test machine reports `AE32`.
 - The panel does not use DSC (compression). The code does not handle DSC.
-- Display Core starts before the SMU after `0032`, so it cannot read the SMU's clock table
+- Display Core starts before the SMU after `0031`, so it cannot read the SMU's clock table
   and uses built-in defaults. On the iMac20,1 this falls back to Navi 14 defaults
   ([comment](https://github.com/t2linux/wiki/issues/743#issuecomment-6163146905)). I did not
   look at this on the Navi 10, and I have seen no problem. A maintainer may ask.
@@ -156,9 +155,9 @@ for `amdgpu`.
 
 ### 13. AI-written code, checked by me for behaviour only
 
-AI wrote the new code (patches `0022` to `0037`, except the `0032` hunk), ported and applied
+AI wrote the new code (patches `0021` to `0036`, except the `0031` hunk), ported and applied
 the community patches, wrote the documentation, and ran most of the tests through the rig.
-Patch `0004` and the research behind it were also developed with AI. I directed the work,
+Patch `0003` and the research behind it were also developed with AI. I directed the work,
 checked the screen, and decided what to keep. A `Co-Authored-By: Claude` trailer in a patch
 means that the AI wrote it or applied it. No kernel expert audited the code. The patches
 have no `Signed-off-by` line, because they are not meant for submission.
@@ -177,6 +176,6 @@ checked. I will describe the rig if someone wants to build their own.
   handle the `link-status` request (item 4)?
 - Would tiled-output support in the compositor be easier than the kernel layer? For
   Hyprland, `edschofield` has already shown that it works.
-- Should the probe deferral (`0004`), which I sent to amd-gfx on 2026-09-26, be withdrawn
+- Should the probe deferral (`0003`), which I sent to amd-gfx on 2026-09-26, be withdrawn
   in favour of the reorder? I have not seen replies to it. I could not check the list archive
   while writing this.

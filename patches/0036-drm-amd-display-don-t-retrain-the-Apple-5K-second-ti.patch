@@ -1,0 +1,61 @@
+From f8975a9a02ef823b83e718782d18d055bb68e23c Mon Sep 17 00:00:00 2001
+From: Teemu Haila <teemu.haila@gmail.com>
+Date: Mon, 12 Oct 2026 21:23:14 +0300
+Subject: [PATCH 36/36] drm/amd/display: don't retrain the Apple 5K second tile
+ on a post-training alignment blip
+
+On the stitched iMac20,2 panel, about half of all DPMS wakes fail link 1's
+post-training check: 5 ms after the idle pattern, DPCD 0x204 reads 0x80
+(interlane alignment lost) although clock recovery, EQ and alignment all
+completed during training. DC counts a link loss and retrains, up to four
+times with 100/150/200 ms pauses, each an independent coin flip (about 0.5
+each over 100 wakes), and enables the stream after the fourth loss anyway.
+About 6 % of wakes lose all four; those are the wakes where the root tile
+shows stretched over the panel for up to a second.
+
+Polling the status for 100 ms instead of sampling once showed the sink
+never realigns while the idle pattern runs (27 of 27 losses over 20 wakes),
+but every one of those wakes was healthy at the next link-health pass,
+~400 ms later, with no retrain: the sink realigns once video flows.
+
+For the Apple tiled slave only, log the blip and let the stream start, as
+DC already does for eDP. A real loss is still caught by the stitch's
+link-health check, which retrains the link and escalates.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../dc/link/protocols/link_dp_training.c       | 18 ++++++++++++++++++
+ 1 file changed, 18 insertions(+)
+
+diff --git a/drivers/gpu/drm/amd/display/dc/link/protocols/link_dp_training.c b/drivers/gpu/drm/amd/display/dc/link/protocols/link_dp_training.c
+index a8678b9ea..12b0654a5 100644
+--- a/drivers/gpu/drm/amd/display/dc/link/protocols/link_dp_training.c
++++ b/drivers/gpu/drm/amd/display/dc/link/protocols/link_dp_training.c
+@@ -1549,6 +1549,24 @@ static enum link_training_result dp_transition_to_video_idle(
+ 			msleep(5);
+ 			if (!link->skip_fallback_on_link_loss)
+ 				status = dp_check_link_loss_status(link, lt_settings);
++			/*
++			 * Apple 5K second tile: on about half of all wakes its TCON
++			 * reports interlane alignment lost (0x204=80) right after
++			 * training, although CR, EQ and alignment all completed. It
++			 * stays that way while the idle pattern runs (polled for
++			 * 100 ms: never back), and realigns by itself once video
++			 * flows: the link-health pass ~400 ms later finds it aligned
++			 * with no retrain. Treating it as a loss retrains up to four
++			 * times while the root tile shows stretched over the panel,
++			 * and DC enables the stream after the fourth anyway. So let
++			 * the stream start, as for eDP, and leave a real loss to the
++			 * stitch's link-health check, which retrains and escalates.
++			 */
++			if (status == LINK_TRAINING_LINK_LOSS && dc_link_is_apple_tiled_slave(link)) {
++				DC_LOG_INFO("APPLE5K: link[%u] alignment not reported 5 ms after training; leaving it to link-health\n",
++					    link->link_index);
++				status = LINK_TRAINING_SUCCESS;
++			}
+ 		}
+ 		return status;
+ 	}
+-- 
+2.56.0
+

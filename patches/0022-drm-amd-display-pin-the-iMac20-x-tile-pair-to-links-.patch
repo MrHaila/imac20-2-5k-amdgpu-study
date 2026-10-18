@@ -1,0 +1,68 @@
+From 43fa050231939879318fb25db97d716839dc5065 Mon Sep 17 00:00:00 2001
+From: Teemu Haila <teemu.haila@gmail.com>
+Date: Sat, 10 Oct 2026 20:53:14 +0300
+Subject: [PATCH 22/36] drm/amd/display: pin the iMac20,x tile pair to links 0
+ and 1 (A2)
+
+dm_helpers_wire_tiled_peer() pairs the eDP root with the first unwired DP
+link. On the iMac20,x the panel's second tile is always link_index 1, which
+is what the t2linux iMac20 patch (7003) hard-codes and what its boot logs
+show training at the tile timing. Where the Thunderbolt DP outputs sit in
+link order has not been checked, and adopting one as the tile would
+send a user's external monitor the panel's vendor DPCD writes and a cloned
+tile timing for the rest of the boot.
+
+On a DMI-matched iMac20 accept only the pair (0 eDP, 1 DP). Other machines
+keep the generic rule.
+
+[adapter: new, Sysadmin patches/amdgpu-imac20-2-5k-stitch DESIGN.md A2]
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01SUvgXxxT5Apr7YLjKZVd2T
+---
+ .../amd/display/amdgpu_dm/amdgpu_dm_helpers.c | 22 +++++++++++++++++++
+ 1 file changed, 22 insertions(+)
+
+diff --git a/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm_helpers.c b/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm_helpers.c
+index 8cad3ace6..4b8918332 100644
+--- a/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm_helpers.c
++++ b/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm_helpers.c
+@@ -95,6 +95,26 @@ static u32 edid_extract_panel_id(struct edid *edid)
+ 	       (u32)EDID_PRODUCT_ID(edid);
+ }
+ 
++/*
++ * iMac20,x: the panel's links are fixed, eDP root at link_index 0 and DP
++ * slave at link_index 1 (the pair the t2linux iMac20 patch drives). The
++ * generic "first DP sibling" rule below would otherwise accept whatever DP
++ * link enumerates first, e.g. a Thunderbolt port, and send it the panel's
++ * vendor DPCD writes and a cloned tile timing.
++ */
++static bool dm_helpers_tiled_pair_allowed(const struct dc_link *link,
++					  const struct dc_link *other)
++{
++	const struct dc_link *root, *slave;
++
++	if (!link->dc->config.apple_imac20_tiles)
++		return true;
++
++	root = link->connector_signal == SIGNAL_TYPE_EDP ? link : other;
++	slave = root == link ? other : link;
++	return root->link_index == 0 && slave->link_index == 1;
++}
++
+ /*
+  * Wire the two tiles of an Apple 5K panel to each other (link->tiled_peer):
+  * the eDP root to its first DP sibling, the DP slave to the eDP root. The
+@@ -129,6 +149,8 @@ static void dm_helpers_wire_tiled_peer(struct dc_link *link,
+ 		other = link->dc->links[i];
+ 		if (!other || other == link || other->tiled_peer)
+ 			continue;
++		if (!dm_helpers_tiled_pair_allowed(link, other))
++			continue;
+ 		if ((is_root && other->connector_signal == SIGNAL_TYPE_DISPLAY_PORT) ||
+ 		    (is_slave && dc_link_is_apple_tiled_root(other))) {
+ 			link->tiled_peer = other;
+-- 
+2.56.0
+
